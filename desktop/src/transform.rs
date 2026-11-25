@@ -1,940 +1,1221 @@
-//! Transform, as the Android app's (ui/TransformUi.kt): the box over what moves (its dashed edges,
-//! its nodes, the rotate node above it and the box-turning node below it; a warp's lines and
-//! control points), and the floating toolbar at the foot of the window (Freeform, Uniform,
-//! Distort and Warp; Snapping or Advanced Mesh, the flips, Rotate 45°, Fit to Canvas,
-//! Interpolation, Reset) with its popovers, and a node's numbers typed in (transform_numeric.rs).
-//! The shared touches work the box.
+//! Transforming a layer's content: the box drawn around it, and how its handles, the toolbar's
+//! actions and undo change where the content goes.
+//!
+//! The content's place is the quad its source rectangle's corners are carried to; the box is
+//! usually that quad, but turning the box alone (the node below it) leaves the content where it is
+//! and fits the box around it at the new angle. Every change to the box carries the content with
+//! it through the map from the old box to the new one.
+//!
+//! A warp lays a 4 × 4 mesh (`warp.rs`) over the content; once there is one it places the content,
+//! and the box is its corners.
 
-use std::time::Instant;
+use crate::geom::{Affine, Homography, Vec2};
+use crate::warp::{self, Mesh};
 
-use egui::epaint::PathShape;
-use egui::{Align2, Color32, Id, LayerId, Order, Pos2, Rect, Sense, Shape, Stroke, Ui, pos2, vec2};
-use procraft_core::{
-    CanvasSession, GuideSettings, Interpolation, TransformAction, TransformBox, TransformHandle, TransformKind,
-    TransformTouch,
-};
-
-use crate::icons::{self, Icon, Part};
-use crate::look::{Look, Themed, Weight, argb, mix, pc, text};
-use crate::transform_numeric::Numeric;
-
-pub(crate) const NODE_BLUE: u32 = 0xFF0171EA;
-const ROTATE_GREEN: u32 = 0xFF00E607;
-const ROTATE_LINE: u32 = 0xFF00E400;
-const TURN_ORANGE: u32 = 0xFFFEB800;
-const TURN_LINE: u32 = 0xFFFEBF00;
-pub(crate) const DASH: u32 = 0xE6000000;
-pub(crate) const DASH_GAP: u32 = 0xE6FFFFFF;
-const NODE_SHADOW: u32 = 0x1F000000;
-const MESH_LINE: u32 = 0xFF8B8B8B;
-/// The lines a moved box snapped onto, across the canvas (dark and light interface).
-const SNAP_GUIDE: Themed = Themed(0xFFFF9F0A, 0xFFFF9500);
-/// A held node is drawn this much larger; a let-go rotate or box-turning node springs back over
-/// this long.
-const HELD_SCALE: f32 = 1.5;
-const HANDLE_RETURN: f32 = 0.5;
-
-/// The floating toolbar: clear of the window's sides by this much, its buttons this far in, and
-/// where the room beside the margins is narrower than this, the buttons' names go.
-const TOOLBAR_MARGIN: f32 = 8.0;
-const TOOLBAR_PADDING: f32 = 16.0;
-const NAMES_FROM: f32 = 700.0;
-const TOOLBAR_HEIGHT: f32 = 126.0;
-const TOOLBAR_BOTTOM: f32 = 25.0;
-const TOOLBAR_CORNER: f32 = 33.0;
-const TOOLBAR_FILL: Themed = Themed(0xF71E1E1E, 0xF7F2F2F2);
-const SEGMENT_TRACK: Themed = Themed(0xFF535353, 0xFFFFFFFF);
-const SEGMENT_EDGE: Themed = Themed(0xFF7E7E7E, 0xFFEBEBEB);
-const SEGMENT_TEXT: Themed = Themed(0xFFC1C1C1, 0xFF3B3B3B);
-const BUTTON_TEXT: Themed = Themed(0xFFA3A3A3, 0xFF414141);
-const BUTTON_DIMMED: Themed = Themed(0xFF575757, 0xFF989898);
-const SEGMENT_GAP: f32 = 11.33;
-const SEGMENT_GAP_TIGHT: f32 = 2.0;
-/// The toolbar's buttons with room (narrower where the window is), and the gap between them.
-pub(crate) const BUTTON_ROOMY: f32 = 89.0;
-const BUTTON_HEIGHT: f32 = 60.0;
-const BUTTON_GAP: f32 = 19.0;
-/// The popovers over the toolbar.
-pub(crate) const MENU_WIDTH: f32 = 260.0;
-pub(crate) const MENU_ARROW: f32 = 15.0;
-const MENU_CORNER: f32 = 26.0;
-const MENU_FILL: Themed = Themed(0xEB2A2A2A, 0xEBF0F0F0);
-pub(crate) const MENU_GROUP: Themed = Themed(0xFF313131, 0xFFFFFFFF);
-pub(crate) const MENU_LINE: Themed = Themed(0xFF373737, 0xFFE2E2E2);
-pub(crate) const MENU_TEXT: Themed = Themed(0xFFC5C5C5, 0xFF393939);
-const SLIDER_REST: Themed = Themed(0xFF5A5A5A, 0xFFDDDDDD);
-const SWITCH_OFF: Themed = Themed(0xFF747377, 0xFFA9A8AC);
-/// Snapping's distance (points) and velocity, as their sliders run.
-const SNAP_DISTANCE: (f32, f32, f32) = (1.0, 50.0, 3.0);
-const SNAP_VELOCITY_MAX: f32 = 10.0;
-
-/// Advanced Mesh's icon: cells four across, three down, with thin gaps, as the Android app draws it.
-const ADVANCED_MESH: Icon = Icon {
-    name: "advanced-mesh",
-    width: 24.0,
-    height: 24.0,
-    parts: &[Part {
-        d: "M1.5 4.9h4.425v4.033h-4.425zM7.125 4.9h4.425v4.033h-4.425zM12.75 4.9h4.425v4.033h-4.425zM18.375 4.9h4.425v4.033h-4.425zM1.5 10.133h4.425v4.033h-4.425zM7.125 10.133h4.425v4.033h-4.425zM12.75 10.133h4.425v4.033h-4.425zM18.375 10.133h4.425v4.033h-4.425zM1.5 15.366h4.425v4.033h-4.425zM7.125 15.366h4.425v4.033h-4.425zM12.75 15.366h4.425v4.033h-4.425zM18.375 15.366h4.425v4.033h-4.425z",
-        stroke: 0.6,
-        fill: true,
-        even_odd: false,
-    }],
-};
-
-/// The popover open over the toolbar.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Popup {
-    None,
-    Snapping,
-    Interpolation,
+/// How the box's handles change the content.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TransformMode {
+    /// Corners and edges stretch the box along its own axes.
+    Freeform,
+    /// Corners and edges scale the box, keeping its proportions.
+    Uniform,
+    /// Corners move on their own; edges move both their corners.
+    Distort,
+    /// The content is bent through a mesh: its points, or the surface between them, are dragged.
+    Warp,
 }
 
-/// What a transform's toolbar asked.
-enum Asked {
-    Kind(TransformKind),
-    Action(TransformAction),
-    Popup(Popup),
-    AdvancedMesh,
-    Background,
+/// What a drag holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Handle {
+    /// A corner node: 0 top left, 1 top right, 2 bottom right, 3 bottom left.
+    Corner(u8),
+    /// The node in the middle of an edge: 0 top, 1 right, 2 bottom, 3 left.
+    Edge(u8),
+    /// The node above the box: turns the content about the box's centre.
+    Rotate,
+    /// The node below the box: turns the box alone, which then fits the content again.
+    TurnBox,
+    /// Anywhere else: moves the content (in a warp, drags the mesh's surface under the touch).
+    Move,
+    /// One of a warp's 16 control points, row by row.
+    Mesh(u8),
 }
 
+/// Four corners: top left, top right, bottom right, bottom left.
+pub type Quad = [Vec2; 4];
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Placement {
+    content: Quad,
+    frame: Quad,
+    warp: Option<Mesh>,
+}
+
+/// An open transform.
+#[derive(Clone, Debug)]
 pub struct Transform {
-    /// The transform is open, and its box as it now is.
-    pub on: bool,
-    shown: Option<TransformBox>,
-    kind: TransformKind,
-    interpolation: Interpolation,
-    guides: GuideSettings,
-    advanced: bool,
-    popup: Popup,
-    /// The node held and where (window pixels); a rotate or box-turning node let go, where, and when.
-    held: Option<(TransformHandle, Pos2)>,
-    let_go: Option<(TransformHandle, Pos2, Instant)>,
-    /// A node's numbers being typed.
-    numeric: Option<Numeric>,
+    source: Quad,
+    /// The convex hull of the content's pixels, in source coordinates.
+    hull: Vec<Vec2>,
+    now: Placement,
+    history: Vec<Placement>,
+    /// The handle held, where the drag started and the placement then.
+    drag: Option<(Handle, Vec2, Placement)>,
+    /// Lines a moved box snaps onto besides the canvas's own (canvas pixels): other layers'
+    /// edges and middles, across (x) and down (y).
+    snap_lines: (Vec<f32>, Vec<f32>),
+    /// The lines (an x and a y, canvas pixels) the box held in a move has snapped onto now.
+    snapped: [Option<f32>; 2],
 }
 
-impl Default for Transform {
-    fn default() -> Transform {
-        Transform {
-            on: false,
-            shown: None,
-            kind: TransformKind::Freeform,
-            interpolation: Interpolation::Bilinear,
-            guides: GuideSettings::default(),
-            advanced: false,
-            popup: Popup::None,
-            held: None,
-            let_go: None,
-            numeric: None,
-        }
-    }
+/// What a drag is pulled towards.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Guides {
+    /// Moves keep to 15° directions once past `lock_after`, and turns to 15° steps.
+    pub magnetics: bool,
+    /// How far (canvas pixels) a move goes before its direction locks.
+    pub lock_after: f32,
+    /// A moved box's edges and centre this near (canvas pixels) the canvas's edges or centre go
+    /// onto them; none for no snapping.
+    pub snap: Option<f32>,
+    /// The canvas's size.
+    pub canvas: Vec2,
 }
+
+/// Smallest scale a handle can bring the box to.
+const MIN_SCALE: f32 = 0.01;
+
+/// How much one pinch can scale what the box holds, from where the fingers took it: down to
+/// 1/1024 and up to 1024 times.
+const PINCH_SCALE: (f32, f32) = (1.0 / 1024.0, 1024.0);
+
+/// The step magnetics keeps directions and turns to.
+const MAGNETIC_STEP: f32 = std::f32::consts::PI / 12.0;
 
 impl Transform {
-    /// Starts transforming the current layer (the caller has checked it takes changes). Returns
-    /// what to say when there is nothing there to move.
-    pub fn begin(&mut self, session: &CanvasSession) -> Result<(), String> {
-        session.transform_set_interpolation(self.interpolation);
-        session.transform_set_guides(self.guides);
-        let Some(shown) = session.transform_begin() else { return Err(session.transform_refusal()) };
-        // a warp lays its mesh over what began
-        self.shown = session.transform_set_kind(self.kind).or(Some(shown));
-        self.popup = Popup::None;
-        self.on = true;
-        session.set_touch_transforming(Some(TransformTouch { advanced_mesh: self.advanced }));
-        Ok(())
-    }
-
-    /// Ends the transform: `commit` keeps the change as one undo step, else the layer goes back.
-    pub fn end(&mut self, session: &CanvasSession, commit: bool) {
-        if !self.on {
-            return;
-        }
-        session.transform_end(commit);
-        session.set_touch_transforming(None);
-        self.on = false;
-        self.shown = None;
-        self.popup = Popup::None;
-        self.held = None;
-        self.let_go = None;
-        self.numeric = None;
-    }
-
-    /// A touch came down on the box: its popover closes.
-    pub fn touched(&mut self) {
-        self.popup = Popup::None;
-    }
-
-    /// The box as it now is, if the touches say.
-    pub fn moved(&mut self, shown: Option<TransformBox>) {
-        if shown.is_some() {
-            self.shown = shown;
+    /// A transform of the content inside the rectangle (`x`, `y`, `width`, `height`, canvas
+    /// pixels) whose pixels' convex hull is `hull`.
+    pub fn new(x: f32, y: f32, width: f32, height: f32, hull: Vec<Vec2>) -> Transform {
+        let source =
+            [Vec2::new(x, y), Vec2::new(x + width, y), Vec2::new(x + width, y + height), Vec2::new(x, y + height)];
+        let now = Placement { content: source, frame: source, warp: None };
+        Transform {
+            source,
+            hull,
+            now,
+            history: Vec::new(),
+            drag: None,
+            snap_lines: (Vec::new(), Vec::new()),
+            snapped: [None; 2],
         }
     }
 
-    pub fn held(&mut self, handle: TransformHandle, at: Pos2) {
-        self.held = Some((handle, at));
+    /// Other things a moved box snaps onto: their bounds (`x`, `y`, `width`, `height`, canvas
+    /// pixels), by their edges and middles.
+    pub fn set_snap_targets(&mut self, bounds: &[[f32; 4]]) {
+        let ok = |v: &f32| v.is_finite();
+        self.snap_lines = (
+            bounds.iter().flat_map(|&[x, _, w, _]| [x, x + w / 2.0, x + w]).filter(ok).collect(),
+            bounds.iter().flat_map(|&[_, y, _, h]| [y, y + h / 2.0, y + h]).filter(ok).collect(),
+        );
     }
 
-    pub fn let_go(&mut self, handle: TransformHandle, at: Pos2) {
-        self.held = None;
-        if matches!(handle, TransformHandle::Rotate | TransformHandle::TurnBox) {
-            self.let_go = Some((handle, at, Instant::now()));
-        }
+    /// The source rectangle's corners.
+    pub fn source(&self) -> Quad {
+        self.source
     }
 
-    /// A node tapped: its numbers to type, the angle's for the rotate node, beside it at `at`
-    /// (points), on the box's `right` side or its left.
-    pub fn numbers(&mut self, angle: bool, at: Pos2, right: bool) {
-        self.popup = Popup::None;
-        self.numeric = Some(Numeric::new(angle, at, right, self.kind == TransformKind::Uniform));
+    /// Where the source rectangle's corners are now.
+    pub fn content(&self) -> Quad {
+        self.now.content
     }
 
-    /// Draws the box over the canvas and the toolbar at the foot of the window; does what the
-    /// toolbar asks. A frosted panel's blur goes into `backdrops`.
-    pub fn show(&mut self, ctx: &egui::Context, look: &mut Look, session: &CanvasSession, backdrops: &mut Vec<f32>) {
-        if !self.on {
-            return;
-        }
-        self.overlay(ctx, session);
-        if let Some(asked) = self.toolbar(ctx, look) {
-            match asked {
-                Asked::Kind(kind) => {
-                    self.kind = kind;
-                    self.moved(session.transform_set_kind(kind));
-                }
-                Asked::Action(action) => {
-                    self.popup = Popup::None;
-                    self.moved(session.transform_apply(action));
-                }
-                Asked::Popup(p) => self.popup = if self.popup == p { Popup::None } else { p },
-                Asked::AdvancedMesh => {
-                    self.advanced = !self.advanced;
-                    session.set_touch_transforming(Some(TransformTouch { advanced_mesh: self.advanced }));
-                }
-                Asked::Background => self.popup = Popup::None,
-            }
-        }
-        // Escape closes the popover, as a touch on the canvas does
-        if self.popup != Popup::None && crate::ui::escape(ctx) {
-            self.popup = Popup::None;
-        }
-        self.popover(ctx, look, session);
-        if let (Some(numeric), Some(b)) = (self.numeric.as_mut(), self.shown.clone()) {
-            let (changed, open) = numeric.show(ctx, look, session, &b, backdrops);
-            self.moved(changed);
-            if !open {
-                self.numeric = None;
-            }
+    /// Where the source rectangle's corners go as the content's pixels are drawn: where the
+    /// content is, except that content only moved, turned by quarter turns or mirrored (its size
+    /// and shape as they were, no warp) goes the nearest whole number of pixels, halves away from
+    /// zero. Every pixel then lands on a pixel and is drawn as it was, whatever the filter, so
+    /// moving a drawing never softens it.
+    pub fn placed(&self) -> Quad {
+        match self.now.warp {
+            Some(_) => self.now.content,
+            None => whole_pixel_move(self.source, self.now.content).unwrap_or(self.now.content),
         }
     }
 
-    /// The box: dashed edges, its nodes, the rotate node and the box-turning node (or a warp's
-    /// lines and control points).
-    fn overlay(&mut self, ctx: &egui::Context, session: &CanvasSession) {
-        let Some(b) = self.shown.clone() else { return };
-        let ppp = ctx.pixels_per_point();
-        let view = session.view_matrix();
-        let painter = ctx.layer_painter(LayerId::new(Order::Middle, Id::unique("transform box")));
-        let scale = |h: TransformHandle| if self.held.is_some_and(|(held, _)| held == h) { HELD_SCALE } else { 1.0 };
-        if self.kind == TransformKind::Warp && b.mesh.len() == 32 {
-            let point = |x: f32, y: f32| {
-                let [a, bb, c, d, e, f] =
-                    view.get(..6).and_then(|v| <[f32; 6]>::try_from(v).ok()).unwrap_or([1.0, 0.0, 0.0, 1.0, 0.0, 0.0]);
-                pos2(a * x + c * y + e, bb * x + d * y + f) / ppp
-            };
-            let mesh: Vec<Pos2> = b.mesh.as_chunks::<2>().0.iter().map(|&[x, y]| point(x, y)).collect();
-            if self.advanced {
-                // the control points joined along each row, and down the two edges, dotted
-                let dots = |from: Pos2, to: Pos2| {
-                    painter.extend(Shape::dashed_line(&[from, to], Stroke::new(1.0, argb(DASH)), 1.0, 2.0));
-                };
-                for k in 0..4 {
-                    for j in 0..3 {
-                        if let (Some(&p), Some(&q)) = (mesh.get(k * 4 + j), mesh.get(k * 4 + j + 1)) {
-                            dots(p, q);
-                        }
-                        if (k == 0 || k == 3)
-                            && let (Some(&p), Some(&q)) = (mesh.get(j * 4 + k), mesh.get((j + 1) * 4 + k))
-                        {
-                            dots(p, q);
-                        }
-                    }
-                }
-            }
-            let per_line = b.grid.len() / 2 / 8;
-            if per_line >= 2 {
-                for line in b.grid.as_chunks::<2>().0.chunks(per_line).take(8) {
-                    let points: Vec<Pos2> = line.iter().map(|&[x, y]| point(x, y)).collect();
-                    painter.add(PathShape::line(points, Stroke::new(1.0, argb(MESH_LINE))));
-                }
-            }
-            let held = self.held.map(|(h, _)| h);
-            for i in procraft_core::shown_mesh_points(self.advanced) {
-                let corner_of = |h: TransformHandle| match h {
-                    TransformHandle::Corner { index } => [0u8, 3, 15, 12].get(usize::from(index % 4)).copied(),
-                    _ => None,
-                };
-                let holding = held == Some(TransformHandle::Mesh { index: i }) || held.and_then(corner_of) == Some(i);
-                if let Some(&p) = mesh.get(usize::from(i)) {
-                    node(&painter, p, argb(NODE_BLUE), if holding { HELD_SCALE } else { 1.0 });
-                }
-            }
-            return;
+    /// The box shown around the content.
+    pub fn frame(&self) -> Quad {
+        self.now.frame
+    }
+
+    /// The warp's mesh, once there is one.
+    pub fn warp(&self) -> Option<Mesh> {
+        self.now.warp
+    }
+
+    pub fn can_undo(&self) -> bool {
+        !self.history.is_empty()
+    }
+
+    /// Lays a warp's mesh evenly over the content, unless there is one already (not a step of its
+    /// own: nothing moves).
+    pub fn start_warp(&mut self) {
+        if self.now.warp.is_none() {
+            self.now.warp = Some(warp::over_quad(self.now.content));
+            self.now.frame = self.now.content;
         }
-        // the lines the box snapped onto, across the canvas, while it is held (under the box)
-        let [va, vb, vc, vd, ve, vf] =
-            view.get(..6).and_then(|v| <[f32; 6]>::try_from(v).ok()).unwrap_or([1.0, 0.0, 0.0, 1.0, 0.0, 0.0]);
-        let point = |x: f32, y: f32| pos2(va * x + vc * y + ve, vb * x + vd * y + vf) / ppp;
-        for &[x0, y0, x1, y1] in b.snap_lines.as_chunks::<4>().0 {
-            painter.line_segment([point(x0, y0), point(x1, y1)], Stroke::new(1.0, argb(SNAP_GUIDE)));
+    }
+
+    /// A drag of `handle` starts at canvas point `at`.
+    pub fn grab(&mut self, handle: Handle, at: Vec2) {
+        self.drag = Some((handle, at, self.now));
+    }
+
+    /// The drag reached canvas point `to`, in `mode`, pulled by `guides`. Returns whether
+    /// anything moved.
+    pub fn drag(&mut self, mode: TransformMode, to: Vec2, guides: &Guides) -> bool {
+        let Some((handle, from, start)) = self.drag else { return false };
+        if !to.is_finite() {
+            return false;
         }
-        let Some(s) = procraft_core::screen_box(b.corners, view, ppp) else { return };
-        let at = |v: &[f32], i: usize| match (v.get(2 * i), v.get(2 * i + 1)) {
-            (Some(&x), Some(&y)) => pos2(x, y) / ppp,
-            _ => Pos2::ZERO,
+        let next = self.dragged(handle, mode, from, to, start, guides).unwrap_or(start);
+        let moved = next != self.now;
+        self.now = next;
+        // a moved box sitting on a line it snaps to shows that line while held
+        self.snapped = match (handle, guides.snap) {
+            (Handle::Move, Some(_)) => lines_under(next.frame, guides.canvas, &self.snap_lines),
+            _ => [None; 2],
         };
-        let corners: Vec<Pos2> = (0..4).map(|i| at(&s.corners, i)).collect();
-        let edges: Vec<Pos2> = (0..4).map(|i| at(&s.edges, i)).collect();
-        // the rotate and box-turning nodes follow the pointer while held, and spring back when let go
-        if self.let_go.is_some_and(|(_, _, since)| since.elapsed().as_secs_f32() >= HANDLE_RETURN) {
-            self.let_go = None;
-        } else if self.let_go.is_some() {
-            ctx.request_repaint();
-        }
-        let (held, let_go) = (self.held, self.let_go);
-        let placed = |h: TransformHandle, rest: Pos2| {
-            if let Some((_, p)) = held.filter(|(held, _)| *held == h) {
-                return p / ppp;
-            }
-            if let Some((_, from, since)) = let_go.filter(|(l, _, _)| *l == h) {
-                let k = (since.elapsed().as_secs_f32() / HANDLE_RETURN).min(1.0);
-                return (from / ppp).lerp(rest, k);
-            }
-            rest
-        };
-        let rotate = placed(TransformHandle::Rotate, at(&s.rotate, 0));
-        let turn = placed(TransformHandle::TurnBox, at(&s.turn, 0));
-        let mut outline = corners.clone();
-        outline.extend(corners.first());
-        painter.extend(Shape::dashed_line_with_offset(&outline, Stroke::new(1.0, argb(DASH_GAP)), &[5.0], &[5.0], 5.0));
-        painter.extend(Shape::dashed_line_with_offset(&outline, Stroke::new(1.0, argb(DASH)), &[5.0], &[5.0], 0.0));
-        if let (Some(&top), Some(&bottom)) = (edges.first(), edges.get(2)) {
-            painter.line_segment([top, rotate], Stroke::new(1.0, argb(ROTATE_LINE)));
-            painter.line_segment([bottom, turn], Stroke::new(1.0, argb(TURN_LINE)));
-        }
-        for (i, &p) in corners.iter().enumerate() {
-            node(&painter, p, argb(NODE_BLUE), scale(TransformHandle::Corner { index: i as u8 }));
-        }
-        for (i, &p) in edges.iter().enumerate() {
-            node(&painter, p, argb(NODE_BLUE), scale(TransformHandle::Edge { index: i as u8 }));
-        }
-        node(&painter, rotate, argb(ROTATE_GREEN), scale(TransformHandle::Rotate));
-        // the box-turning node is a square, turned with the box
-        let k = scale(TransformHandle::TurnBox);
-        let up = vec2(s.up.first().copied().unwrap_or(0.0), s.up.get(1).copied().unwrap_or(-1.0));
-        let angle = up.x.atan2(-up.y);
-        let square = |side: f32| {
-            let (sin, cos) = angle.sin_cos();
-            [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)]
-                .map(|(x, y): (f32, f32)| turn + vec2(x * cos - y * sin, x * sin + y * cos) * side / 2.0)
-                .to_vec()
-        };
-        painter.circle_filled(turn, 5.5 * k + 0.5, argb(NODE_SHADOW));
-        painter.add(Shape::convex_polygon(square(11.0 * k), Color32::WHITE, Stroke::NONE));
-        painter.add(Shape::convex_polygon(square(8.0 * k), argb(TURN_ORANGE), Stroke::NONE));
+        moved
     }
 
-    /// The floating toolbar: the four kinds in a pill over the buttons. Returns what was asked.
-    fn toolbar(&mut self, ctx: &egui::Context, look: &mut Look) -> Option<Asked> {
-        let kinds = [
-            (&icons::FREEFORM, "Freeform", self.kind == TransformKind::Freeform),
-            (&icons::UNIFORM, "Uniform", self.kind == TransformKind::Uniform),
-            (&icons::DISTORT, "Distort", self.kind == TransformKind::Distort),
-            (&icons::WARP, "Warp", self.kind == TransformKind::Warp),
-        ];
-        let all = [TransformKind::Freeform, TransformKind::Uniform, TransformKind::Distort, TransformKind::Warp];
-        let warp = self.kind == TransformKind::Warp;
-        let buttons: [Button; 7] = [
-            if warp {
-                Button::new(&ADVANCED_MESH, "Advanced Mesh", 28.8).active(self.advanced)
-            } else {
-                Button::new(&icons::SNAPPING, "Snapping", 44.0).active(self.popup == Popup::Snapping)
-            },
-            Button::new(&icons::FLIP_HORIZONTAL, "Flip Horizontal", 50.0),
-            Button::new(&icons::FLIP_VERTICAL, "Flip Vertical", 50.0),
-            Button::new(&icons::ROTATE45, "Rotate 45\u{b0}", 44.0),
-            Button::new(&icons::FIT_TO_CANVAS, "Fit to Canvas", 35.0),
-            Button::new(&icons::INTERPOLATION, interpolation_name(self.interpolation, true), 44.0)
-                .active(self.popup == Popup::Interpolation),
-            Button::new(&icons::TRANSFORM_RESET, "Reset", 44.0),
-        ];
-        let tapped = floating_toolbar(ctx, look, "transform toolbar", BUTTON_ROOMY, &kinds, &buttons, 43.0)?;
-        Some(match tapped {
-            Tapped::Background => Asked::Background,
-            Tapped::Segment(k) => Asked::Kind(all.get(k).copied().unwrap_or(TransformKind::Freeform)),
-            Tapped::Button(0) if warp => Asked::AdvancedMesh,
-            Tapped::Button(0) => Asked::Popup(Popup::Snapping),
-            Tapped::Button(1) => Asked::Action(TransformAction::FlipHorizontal),
-            Tapped::Button(2) => Asked::Action(TransformAction::FlipVertical),
-            Tapped::Button(3) => Asked::Action(TransformAction::Rotate45),
-            Tapped::Button(4) => Asked::Action(TransformAction::FitToCanvas),
-            Tapped::Button(5) => Asked::Popup(Popup::Interpolation),
-            Tapped::Button(_) => Asked::Action(TransformAction::Reset),
-        })
+    /// Two fingers held the content from `from` and have reached `to` (canvas points, each pair
+    /// the same two fingers): it goes with them, moved, turned and scaled as a whole from where
+    /// [`Transform::grab`] took it, the box with it (a box stays the shape it is, whatever the
+    /// mode). Returns whether anything moved.
+    pub fn pinch(&mut self, from: [Vec2; 2], to: [Vec2; 2]) -> bool {
+        let Some((_, _, start)) = self.drag else { return false };
+        let (was, now) = (from[1] - from[0], to[1] - to[0]);
+        if !(from.iter().chain(&to).all(|p| p.is_finite()) && was.length() > 1e-3 && now.length() > 1e-3) {
+            return false;
+        }
+        let (middle_was, middle) = (from[0].lerp(from[1], 0.5), to[0].lerp(to[1], 0.5));
+        let spread = now.length() / was.length();
+        let scale = if spread.is_nan() { PINCH_SCALE.0 } else { spread.clamp(PINCH_SCALE.0, PINCH_SCALE.1) };
+        let m = Affine::translate(Vec2::ZERO - middle_was)
+            .then(Affine::scale(scale))
+            .then(Affine::rotate(angle(now) - angle(was)))
+            .then(Affine::translate(middle));
+        let next = map_placement(&start, m);
+        // pinched again and again, the content could go past what can be drawn (to a point, or out
+        // past any number): it stays where the last step that could be drawn left it
+        if !self.drawable(&next) {
+            return false;
+        }
+        let moved = next != self.now;
+        self.now = next;
+        moved
     }
 
-    /// The popover over the toolbar, its arrow on its button: Interpolation, or Snapping's settings.
-    fn popover(&mut self, ctx: &egui::Context, look: &mut Look, session: &CanvasSession) {
-        if self.popup == Popup::None {
-            return;
+    /// Whether content placed as in `p` can be drawn: every point a number, the box's sides too,
+    /// and its pixels found again from where they go (the map from the source to its place
+    /// undoes).
+    fn drawable(&self, p: &Placement) -> bool {
+        let finite = p.content.iter().chain(&p.frame).chain(p.warp.iter().flatten()).all(|v| v.is_finite());
+        let [a, b, _, d] = p.frame;
+        finite
+            && a.distance(b).is_finite()
+            && a.distance(d).is_finite()
+            && Homography::quad_to_quad(p.content, self.source).is_some()
+    }
+
+    /// The lines (x across, y down, canvas pixels) the box held in a move has snapped onto: shown
+    /// as guides until it is let go.
+    pub fn snapped(&self) -> [Option<f32>; 2] {
+        self.snapped
+    }
+
+    /// The drag ends; a change is kept as an undo step.
+    pub fn release(&mut self) {
+        self.snapped = [None; 2];
+        if let Some((_, _, start)) = self.drag.take()
+            && start != self.now
+        {
+            self.history.push(start);
         }
-        let index = if self.popup == Popup::Snapping { 0 } else { 5 };
-        let (tip_x, tip_y) = button_tip(ctx, BUTTON_ROOMY, index, 7);
-        let screen = ctx.content_rect();
-        let body_height = match self.popup {
-            Popup::Interpolation => 40.0 + 10.0 + 40.0 * 3.0 + 2.0,
-            _ => 40.0 + 4.0 + 49.0 * 2.0 + 1.0 + 10.0 + 59.0 * 2.0 + 1.0,
-        } + 20.0;
-        let left = (tip_x - MENU_WIDTH / 2.0).clamp(screen.left(), screen.right() - MENU_WIDTH);
-        let rect = Rect::from_min_size(pos2(left, tip_y - MENU_ARROW - body_height), vec2(MENU_WIDTH, body_height));
-        egui::Area::new(Id::unique("transform popover")).fixed_pos(rect.min).order(Order::Tooltip).show(ctx, |ui| {
-            popover_frame(ui, rect, tip_x, tip_y);
-            let inner = rect.shrink(10.0);
-            let title = |ui: &Ui, words: &str| menu_title(ui, inner, words);
-            match self.popup {
-                Popup::Interpolation => {
-                    title(ui, "Interpolation");
-                    let group = Rect::from_min_size(pos2(inner.left(), inner.top() + 50.0), vec2(inner.width(), 122.0));
-                    ui.painter().rect_filled(group, 13, argb(MENU_GROUP));
-                    let all = [Interpolation::Nearest, Interpolation::Bilinear, Interpolation::Bicubic];
-                    for (i, kind) in all.into_iter().enumerate() {
-                        let row = Rect::from_min_size(
-                            pos2(group.left(), group.top() + 41.0 * i as f32),
-                            vec2(group.width(), 40.0),
-                        );
-                        if i > 0 {
-                            ui.painter().rect_filled(
-                                Rect::from_min_size(row.min - vec2(0.0, 1.0), vec2(row.width(), 1.0)),
-                                0,
-                                argb(MENU_LINE),
-                            );
-                        }
-                        let on = self.interpolation == kind;
-                        if on {
-                            let corners = egui::CornerRadius {
-                                nw: if i == 0 { 13 } else { 0 },
-                                ne: if i == 0 { 13 } else { 0 },
-                                sw: if i == 2 { 13 } else { 0 },
-                                se: if i == 2 { 13 } else { 0 },
-                            };
-                            ui.painter().rect_filled(row, corners, argb(pc::ACCENT));
-                        }
-                        let ink = if on { Color32::WHITE } else { argb(MENU_TEXT) };
-                        text(
-                            ui.painter(),
-                            pos2(row.left() + 11.0, row.center().y),
-                            Align2::LEFT_CENTER,
-                            interpolation_name(kind, false),
-                            16.0,
-                            Weight::Regular,
-                            ink,
-                        );
-                        if on {
-                            look.icon(
-                                ui,
-                                &icons::MENU_TICK,
-                                pos2(row.right() - 14.0 - 14.5, row.center().y),
-                                29.0,
-                                Color32::WHITE,
-                            );
-                        }
-                        if ui.interact(row, ui.scope_id().with(("interpolation", i)), Sense::click()).clicked() {
-                            self.interpolation = kind;
-                            session.transform_set_interpolation(kind);
-                            self.popup = Popup::None;
-                        }
-                    }
-                }
-                _ => {
-                    title(ui, "Settings");
-                    let mut g = self.guides;
-                    let group = Rect::from_min_size(pos2(inner.left(), inner.top() + 44.0), vec2(inner.width(), 99.0));
-                    ui.painter().rect_filled(group, 13, argb(MENU_GROUP));
-                    for (i, (label, on)) in
-                        [("Magnetics", g.magnetics), ("Snapping", g.snapping)].into_iter().enumerate()
-                    {
-                        let row = Rect::from_min_size(
-                            pos2(group.left(), group.top() + 50.0 * i as f32),
-                            vec2(group.width(), 49.0),
-                        );
-                        if i > 0 {
-                            ui.painter().rect_filled(
-                                Rect::from_min_size(row.min - vec2(0.0, 1.0), vec2(row.width(), 1.0)),
-                                0,
-                                argb(MENU_LINE),
-                            );
-                        }
-                        text(
-                            ui.painter(),
-                            pos2(row.left() + 12.0, row.center().y),
-                            Align2::LEFT_CENTER,
-                            label,
-                            16.0,
-                            Weight::Regular,
-                            argb(MENU_TEXT),
-                        );
-                        switch(ui, pos2(row.right() - 6.0 - 63.0, row.center().y - 14.0), on, label);
-                        if ui.interact(row, ui.scope_id().with(("switch", i)), Sense::click()).clicked() {
-                            if i == 0 {
-                                g.magnetics = !g.magnetics;
-                            } else {
-                                g.snapping = !g.snapping;
-                            }
-                        }
-                    }
-                    let sliders =
-                        Rect::from_min_size(pos2(inner.left(), group.bottom() + 10.0), vec2(inner.width(), 119.0));
-                    ui.painter().rect_filled(sliders, 13, argb(MENU_GROUP));
-                    let (lo, hi, default) = SNAP_DISTANCE;
-                    let distance = (g.distance - lo) / (hi - lo);
-                    let shown = if g.distance <= default {
-                        "None".to_owned()
-                    } else {
-                        format!("{}", g.distance.round() as i32)
-                    };
-                    let row = Rect::from_min_size(sliders.min, vec2(sliders.width(), 59.0));
-                    if let Some(v) = menu_slider(ui, row, "Distance", distance, &shown) {
-                        g.distance = (lo + v * (hi - lo)).round();
-                    }
-                    ui.painter().rect_filled(
-                        Rect::from_min_size(pos2(sliders.left(), row.bottom()), vec2(sliders.width(), 1.0)),
-                        0,
-                        argb(MENU_LINE),
-                    );
-                    let shown = if g.velocity >= SNAP_VELOCITY_MAX {
-                        "Max".to_owned()
-                    } else {
-                        format!("{}", g.velocity.round() as i32)
-                    };
-                    let row =
-                        Rect::from_min_size(pos2(sliders.left(), row.bottom() + 1.0), vec2(sliders.width(), 59.0));
-                    if let Some(v) = menu_slider(ui, row, "Velocity", g.velocity / SNAP_VELOCITY_MAX, &shown) {
-                        g.velocity = (v * SNAP_VELOCITY_MAX).round();
-                    }
-                    if g != self.guides {
-                        self.guides = g;
-                        session.transform_set_guides(g);
-                    }
-                }
-            }
+    }
+
+    /// The drag is abandoned (a second finger came down): the box goes back.
+    pub fn cancel_drag(&mut self) {
+        self.snapped = [None; 2];
+        if let Some((_, _, start)) = self.drag.take() {
+            self.now = start;
+        }
+    }
+
+    /// Mirrors the content across the box's upright axis.
+    pub fn flip_horizontal(&mut self) {
+        let [a, b, c, d] = self.now.frame;
+        self.change(|p| {
+            let content = carry(p, [b, a, d, c])?;
+            // a mesh mirrors by taking its columns in the other order
+            let warp =
+                p.warp.map(|m| std::array::from_fn(|k| m.get(k / 4 * 4 + 3 - k % 4).copied().unwrap_or_default()));
+            Some(Placement { content, frame: p.frame, warp })
         });
     }
-}
 
-/// How a floating toolbar is laid out: its width, its buttons' width, how big their icons are
-/// drawn (1: as measured) and whether their names show.
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct ToolbarFit {
-    width: f32,
-    button: f32,
-    icon_scale: f32,
-    names: bool,
-}
-
-/// A floating toolbar of `count` buttons in a window `screen` wide. With room, its buttons are
-/// `roomy` wide (as measured in landscape); where the window less 8 each side is narrower, it is
-/// that wide and its buttons share what is left inside its padding, 19 apart (on a 744 window:
-/// 728, as measured upright). Where the room beside the margins is under 700 the buttons' names
-/// go, and icons as big as `icon` are drawn smaller only where they would run into each other.
-fn toolbar_layout(screen: f32, count: usize, roomy: f32, icon: f32) -> ToolbarFit {
-    let n = count.max(1) as f32;
-    let gaps = BUTTON_GAP * (n - 1.0);
-    let room = screen - TOOLBAR_MARGIN * 2.0;
-    let width = (roomy * n + gaps + TOOLBAR_PADDING * 2.0).min(room).max(0.0);
-    let button = ((width - TOOLBAR_PADDING * 2.0 - gaps) / n).max(0.0);
-    let icon_scale = if icon > 0.0 { ((button + BUTTON_GAP) / icon).clamp(0.0, 1.0) } else { 1.0 };
-    ToolbarFit { width, button, icon_scale, names: room >= NAMES_FROM }
-}
-
-/// The floating toolbar at the foot of the window for `count` buttons, `roomy` wide with room,
-/// their icons at most `icon` across.
-fn toolbar_rect(ctx: &egui::Context, count: usize, roomy: f32, icon: f32) -> (Rect, ToolbarFit) {
-    let screen = ctx.content_rect();
-    let fit = toolbar_layout(screen.width(), count, roomy, icon);
-    let bar = Rect::from_min_size(
-        pos2(screen.center().x - fit.width / 2.0, screen.bottom() - TOOLBAR_BOTTOM - TOOLBAR_HEIGHT),
-        vec2(fit.width, TOOLBAR_HEIGHT),
-    );
-    // (floating, where the layout has it: its buttons and the popovers pointing at them with it)
-    (crate::panel::bottom_rect(ctx, bar), fit)
-}
-
-/// Where a popover over button `index` of a toolbar of `count` (`roomy` wide with room) points:
-/// its button's middle, at the top of the buttons.
-pub(crate) fn button_tip(ctx: &egui::Context, roomy: f32, index: usize, count: usize) -> (f32, f32) {
-    let (bar, fit) = toolbar_rect(ctx, count, roomy, 0.0);
-    (button_centre(bar, fit.button, index, count), bar.top() + 16.0 + 34.0)
-}
-
-/// A toolbar button: its icon, name and icon size; lit while its popover is open; greyed when it
-/// can't be used yet.
-pub(crate) struct Button<'a> {
-    icon: &'a Icon,
-    label: &'a str,
-    size: f32,
-    active: bool,
-    enabled: bool,
-}
-
-impl<'a> Button<'a> {
-    pub(crate) fn new(icon: &'a Icon, label: &'a str, size: f32) -> Button<'a> {
-        Button { icon, label, size, active: false, enabled: true }
+    /// Mirrors the content across the box's level axis.
+    pub fn flip_vertical(&mut self) {
+        let [a, b, c, d] = self.now.frame;
+        self.change(|p| {
+            let content = carry(p, [d, c, b, a])?;
+            let warp =
+                p.warp.map(|m| std::array::from_fn(|k| m.get((3 - k / 4) * 4 + k % 4).copied().unwrap_or_default()));
+            Some(Placement { content, frame: p.frame, warp })
+        });
     }
 
-    pub(crate) fn active(self, active: bool) -> Button<'a> {
-        Button { active, ..self }
+    /// Turns the box and content by `radians` (clockwise on screen) about the box's centre.
+    pub fn rotate(&mut self, radians: f32) {
+        let c = centre(self.now.frame);
+        let m = Affine::translate(Vec2::ZERO - c).then(Affine::rotate(radians)).then(Affine::translate(c));
+        self.change(|p| Some(map_placement(p, m)));
     }
 
-    pub(crate) fn enabled(self, enabled: bool) -> Button<'a> {
-        Button { enabled, ..self }
+    /// Rotate around an artwork-space joint rather than the box centre.
+    pub fn rotate_about(&mut self, pivot: Vec2, radians: f32) {
+        let m = Affine::translate(Vec2::ZERO - pivot).then(Affine::rotate(radians)).then(Affine::translate(pivot));
+        self.change(|p| Some(map_placement(p, m)));
     }
-}
 
-/// What was tapped on a floating toolbar.
-pub(crate) enum Tapped {
-    Background,
-    Segment(usize),
-    Button(usize),
-}
+    /// The box's width and height (canvas pixels), along its top and left edges.
+    pub fn size(&self) -> (f32, f32) {
+        let [a, b, _, d] = self.now.frame;
+        (a.distance(b), a.distance(d))
+    }
 
-/// The floating toolbar at the foot of the window (transform, selection): a row of `segments`
-/// (icon, name, chosen) in a pill, their icons `segment_icon` across, over `buttons` spread across
-/// it (`roomy` wide with room, narrower where the window is). Returns what was tapped.
-pub(crate) fn floating_toolbar(
-    ctx: &egui::Context,
-    look: &mut Look,
-    id: &str,
-    roomy: f32,
-    segments: &[(&Icon, &str, bool)],
-    buttons: &[Button],
-    segment_icon: f32,
-) -> Option<Tapped> {
-    let icon = buttons.iter().map(|b| b.size).fold(0.0, f32::max);
-    let (bar, fit) = toolbar_rect(ctx, buttons.len(), roomy, icon);
-    let button = fit.button;
-    let mut tapped = None;
-    egui::Area::new(Id::unique(id)).fixed_pos(bar.min).order(Order::Foreground).show(ctx, |ui| {
-        // the bar's room claimed, so presses on it stay off the canvas
-        if ui.allocate_rect(bar, Sense::click()).clicked() {
-            tapped = Some(Tapped::Background);
+    /// How far the box is turned from upright (radians, clockwise on screen).
+    pub fn angle(&self) -> f32 {
+        let [a, b, ..] = self.now.frame;
+        angle(b - a)
+    }
+
+    /// Makes the box `width` × `height` (canvas pixels) about its centre, turned as it is: a
+    /// size typed in. A negative size mirrors the content that way.
+    pub fn set_size(&mut self, width: f32, height: f32) {
+        let (w, h) = self.size();
+        if !(width.is_finite() && height.is_finite()) || width.abs() < 1.0 || height.abs() < 1.0 || w <= 0.0 || h <= 0.0
+        {
+            return;
         }
-        ui.painter().rect_filled(bar, TOOLBAR_CORNER, argb(TOOLBAR_FILL));
-        // the pill tightened only where it doesn't fit, and drawn smaller where it still doesn't
-        let inner = bar.width() - TOOLBAR_PADDING * 2.0;
-        let names: Vec<f32> = segments.iter().map(|(_, label, _)| label_width(ui, label)).collect();
-        let row = |pad: SegmentPad| {
-            names.iter().map(|w| pad.width(*w)).sum::<f32>() + pad.gap * (segments.len().max(1) - 1) as f32 + 4.0
+        let c = centre(self.now.frame);
+        let turn = self.angle();
+        let stretch = Affine { a: width.abs() / w, d: height.abs() / h, ..Affine::IDENTITY };
+        let m = Affine::translate(Vec2::ZERO - c)
+            .then(Affine::rotate(-turn))
+            .then(stretch)
+            .then(Affine::rotate(turn))
+            .then(Affine::translate(c));
+        self.change(|p| Some(map_placement(p, m)));
+        if width < 0.0 {
+            self.flip_horizontal();
+        }
+        if height < 0.0 {
+            self.flip_vertical();
+        }
+    }
+
+    /// Turns the box to `radians` from upright (clockwise on screen) about its centre: an angle
+    /// typed in.
+    pub fn set_angle(&mut self, radians: f32) {
+        if radians.is_finite() {
+            self.rotate(radians - self.angle());
+        }
+    }
+
+    /// Scales the box and content alike, keeping their proportions, their turn and any flip, so
+    /// that the box as it is turned (the upright rectangle around it, a warp's mesh too) just fits
+    /// a `width` × `height` canvas, centred on it.
+    pub fn fit(&mut self, width: f32, height: f32) {
+        let mesh = self.now.warp.map(|m| m.to_vec()).unwrap_or_default();
+        let (mut low, mut high) = (Vec2::new(f32::MAX, f32::MAX), Vec2::new(f32::MIN, f32::MIN));
+        for p in self.now.frame.iter().chain(&mesh) {
+            low = Vec2::new(low.x.min(p.x), low.y.min(p.y));
+            high = Vec2::new(high.x.max(p.x), high.y.max(p.y));
+        }
+        let (w, h) = (high.x - low.x, high.y - low.y);
+        if !(w > 0.0 && h > 0.0) {
+            return;
+        }
+        let k = (width / w).min(height / h);
+        let middle = Vec2::new((low.x + high.x) / 2.0, (low.y + high.y) / 2.0);
+        let m = Affine::translate(Vec2::ZERO - middle)
+            .then(Affine { a: k, d: k, ..Affine::IDENTITY })
+            .then(Affine::translate(Vec2::new(width / 2.0, height / 2.0)));
+        self.change(|p| Some(map_placement(p, m)));
+    }
+
+    /// Moves the content one canvas pixel towards `toward`, along whichever axis it is further
+    /// along from the box's centre.
+    pub fn nudge(&mut self, toward: Vec2) {
+        let d = toward - centre(self.now.frame);
+        if !d.is_finite() || d == Vec2::ZERO {
+            return;
+        }
+        let step = if d.x.abs() >= d.y.abs() { Vec2::new(d.x.signum(), 0.0) } else { Vec2::new(0.0, d.y.signum()) };
+        self.change(|p| Some(map_placement(p, Affine::translate(step))));
+    }
+
+    /// Puts the content back where it started.
+    pub fn reset(&mut self) {
+        let source = self.source;
+        self.change(|_| Some(Placement { content: source, frame: source, warp: None }));
+    }
+
+    /// Takes back the last change. Returns whether there was one.
+    pub fn undo(&mut self) -> bool {
+        self.drag = None;
+        match self.history.pop() {
+            Some(p) => {
+                self.now = p;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Applies `f` to the placement, kept as an undo step when it changes anything.
+    fn change(&mut self, f: impl FnOnce(&Placement) -> Option<Placement>) {
+        self.drag = None;
+        let finite =
+            |n: &Placement| n.content.iter().chain(&n.frame).chain(n.warp.iter().flatten()).all(|v| v.is_finite());
+        if let Some(next) = f(&self.now).filter(finite)
+            && next != self.now
+        {
+            self.history.push(self.now);
+            self.now = next;
+        }
+    }
+
+    fn dragged(
+        &self,
+        handle: Handle,
+        mode: TransformMode,
+        from: Vec2,
+        to: Vec2,
+        start: Placement,
+        guides: &Guides,
+    ) -> Option<Placement> {
+        let f = start.frame;
+        let delta = to - from;
+        if mode == TransformMode::Warp
+            && let Some(mesh) = start.warp
+        {
+            return Some(warped(mesh, handle, from, delta));
+        }
+        let distort = mode == TransformMode::Distort;
+        let next = match handle {
+            Handle::Move => {
+                let mut delta = delta;
+                if guides.magnetics && delta.length() > guides.lock_after {
+                    // the direction keeps to the 15° step at or below it
+                    let step = (angle(delta) / MAGNETIC_STEP).floor() * MAGNETIC_STEP;
+                    let (sin, cos) = step.sin_cos();
+                    let along = delta.x * cos + delta.y * sin;
+                    delta = Vec2::new(cos, sin) * along;
+                }
+                if let Some(reach) = guides.snap {
+                    delta = delta + snap_offset(f.map(|p| p + delta), guides.canvas, &self.snap_lines, reach);
+                }
+                map_placement(&start, Affine::translate(delta))
+            }
+            Handle::Rotate => {
+                let c = centre(f);
+                let mut turn = angle(to - c) - angle(from - c);
+                if guides.magnetics {
+                    let [a, b, ..] = f;
+                    let was = angle(b - a);
+                    turn = ((was + turn) / MAGNETIC_STEP).round() * MAGNETIC_STEP - was;
+                }
+                map_placement(
+                    &start,
+                    Affine::translate(Vec2::ZERO - c).then(Affine::rotate(turn)).then(Affine::translate(c)),
+                )
+            }
+            Handle::TurnBox => {
+                let c = centre(f);
+                let turn = angle(to - c) - angle(from - c);
+                let [a, b, ..] = f;
+                let frame = self.fit_box(&start, angle(b - a) + turn)?;
+                Placement { frame, ..start }
+            }
+            Handle::Mesh(_) => start,
+            Handle::Corner(i) => {
+                let i = usize::from(i % 4);
+                let (corner, anchor) = (at(f, i), at(f, i + 2));
+                if distort {
+                    let mut frame = f;
+                    set(&mut frame, i, corner + delta);
+                    return carry_all(&start, frame);
+                }
+                let target = corner + delta;
+                let m = if mode == TransformMode::Uniform {
+                    scale_about(anchor, projected_scale(target, corner, anchor))
+                } else {
+                    // the target in the box's own axes, against the corner's
+                    let basis = basis(f)?.inverse()?;
+                    let (t, c) = (basis.apply(target - anchor), basis.apply(corner - anchor));
+                    let sx = if c.x.abs() > 1e-6 { (t.x / c.x).max(MIN_SCALE) } else { 1.0 };
+                    let sy = if c.y.abs() > 1e-6 { (t.y / c.y).max(MIN_SCALE) } else { 1.0 };
+                    axes_scale_about(f, anchor, sx, sy)?
+                };
+                map_placement(&start, m)
+            }
+            Handle::Edge(k) => {
+                let k = usize::from(k % 4);
+                if distort {
+                    let mut frame = f;
+                    set(&mut frame, k, at(f, k) + delta);
+                    set(&mut frame, k + 1, at(f, k + 1) + delta);
+                    return carry_all(&start, frame);
+                }
+                let mid = at(f, k).lerp(at(f, k + 1), 0.5);
+                let anchor = at(f, k + 2).lerp(at(f, k + 3), 0.5);
+                let s = projected_scale(mid + delta, mid, anchor);
+                let m = if mode == TransformMode::Uniform {
+                    scale_about(anchor, s)
+                } else if k % 2 == 0 {
+                    axes_scale_about(f, anchor, 1.0, s)?
+                } else {
+                    axes_scale_about(f, anchor, s, 1.0)?
+                };
+                map_placement(&start, m)
+            }
         };
-        let pad = if row(SegmentPad::ROOMY) <= inner { SegmentPad::ROOMY } else { SegmentPad::TIGHT };
-        let k = if row(pad) > inner && inner > 0.0 { inner / row(pad) } else { 1.0 };
-        let (row, high) = (row(pad) * k, 34.0 * k);
-        let pill = Rect::from_min_size(
-            pos2(bar.center().x - row / 2.0, bar.top() + 16.0 + (34.0 - high) / 2.0),
-            vec2(row, high),
-        );
-        ui.painter().rect_filled(pill, high / 2.0, argb(SEGMENT_TRACK));
-        ui.painter().rect_stroke(pill, high / 2.0, Stroke::new(0.5, argb(SEGMENT_EDGE)), egui::StrokeKind::Inside);
-        let mut x = pill.left() + 2.0 * k;
-        for (n, ((icon, label, on), w)) in segments.iter().zip(&names).enumerate() {
-            let w = pad.width(*w) * k;
-            let seg = Rect::from_min_size(pos2(x, pill.top() + 2.0 * k), vec2(w, 30.0 * k));
-            if segment(ui, look, seg, (icon, label, *on), segment_icon, pad, k) {
-                tapped = Some(Tapped::Segment(n));
+        Some(next)
+    }
+
+    /// The box at `radians` that just holds the content placed as in `p`.
+    fn fit_box(&self, p: &Placement, radians: f32) -> Option<Quad> {
+        let to_content = Homography::quad_to_quad(self.source, p.content)?;
+        let [s0, s1, _, s3] = self.source;
+        let (w, h) = (s1.x - s0.x, s3.y - s0.y);
+        let place = |q: Vec2| match p.warp {
+            Some(m) if w > 0.0 && h > 0.0 => Some(warp::point(&m, (q.x - s0.x) / w, (q.y - s0.y) / h)),
+            _ => to_content.apply(q),
+        };
+        let points: Vec<Vec2> = if self.hull.is_empty() {
+            p.warp.map_or(p.content.to_vec(), |m| m.to_vec())
+        } else {
+            self.hull.iter().filter_map(|&q| place(q)).collect()
+        };
+        let (sin, cos) = radians.sin_cos();
+        let (u, v) = (Vec2::new(cos, sin), Vec2::new(-sin, cos));
+        let dot = |a: Vec2, b: Vec2| a.x * b.x + a.y * b.y;
+        let (mut u0, mut u1, mut v0, mut v1) = (f32::MAX, f32::MIN, f32::MAX, f32::MIN);
+        for q in &points {
+            let (pu, pv) = (dot(*q, u), dot(*q, v));
+            u0 = u0.min(pu);
+            u1 = u1.max(pu);
+            v0 = v0.min(pv);
+            v1 = v1.max(pv);
+        }
+        (u0 <= u1 && v0 <= v1).then(|| [u * u0 + v * v0, u * u1 + v * v0, u * u1 + v * v1, u * u0 + v * v1])
+    }
+}
+
+/// The convex hull of `points`, without repeats.
+pub fn convex_hull(points: &[Vec2]) -> Vec<Vec2> {
+    let mut pts: Vec<Vec2> = points.iter().copied().filter(|p| p.is_finite()).collect();
+    pts.sort_by(|a, b| a.x.total_cmp(&b.x).then(a.y.total_cmp(&b.y)));
+    pts.dedup();
+    if pts.len() < 3 {
+        return pts;
+    }
+    let mut lower = half_hull(pts.iter());
+    let mut upper = half_hull(pts.iter().rev());
+    // each half ends where the other starts
+    lower.pop();
+    upper.pop();
+    lower.append(&mut upper);
+    lower
+}
+
+/// One side of the hull of points sorted along x (monotone chain).
+fn half_hull<'a>(points: impl Iterator<Item = &'a Vec2>) -> Vec<Vec2> {
+    let cross = |o: Vec2, a: Vec2, b: Vec2| (a.x - o.x) * (b.y - o.y) - (a.y - o.y) * (b.x - o.x);
+    let mut chain: Vec<Vec2> = Vec::new();
+    for &p in points {
+        while let [.., a, b] = *chain.as_slice() {
+            if cross(a, b, p) > 0.0 {
+                break;
             }
-            x += w + pad.gap * k;
+            chain.pop();
         }
-        // a long name smaller only where the buttons are narrow
-        let long = if button < roomy { 11.0 } else { 12.5 };
-        let top = bar.top() + 16.0 + 34.0;
-        for (i, b) in buttons.iter().enumerate() {
-            let centre = button_centre(bar, button, i, buttons.len());
-            let rect = Rect::from_min_size(pos2(centre - button / 2.0, top), vec2(button, BUTTON_HEIGHT));
-            let label_size = if b.label.len() > 12 { long } else { 12.5 };
-            if toolbar_button(ui, look, rect, b, fit.names.then_some(label_size), fit.icon_scale) {
-                tapped = Some(Tapped::Button(i));
+        chain.push(p);
+    }
+    chain
+}
+
+/// How far to shift `frame` so that the nearest of its left, middle and right (and top, middle and
+/// bottom) lands on a line, the canvas's edges and middle or one of `others` (across, down),
+/// when one is within `reach`.
+fn snap_offset(frame: Quad, canvas: Vec2, others: &(Vec<f32>, Vec<f32>), reach: f32) -> Vec2 {
+    let axis = |values: [f32; 4], size: f32, others: &[f32]| {
+        let (lo, hi) = values.iter().fold((f32::MAX, f32::MIN), |(lo, hi), &v| (lo.min(v), hi.max(v)));
+        let features = [lo, (lo + hi) / 2.0, hi];
+        let lines = [0.0, size / 2.0, size];
+        let mut best: Option<f32> = None;
+        for f in features {
+            for &l in lines.iter().chain(others) {
+                let d = l - f;
+                if d.abs() <= reach && best.is_none_or(|b| d.abs() < b.abs()) {
+                    best = Some(d);
+                }
             }
         }
-    });
-    tapped
-}
-
-/// A popover's body at `rect` over a toolbar, its arrow's tip at (`tip_x`, `tip_y`), its shadow
-/// round it; it takes the presses on it.
-pub(crate) fn popover_frame(ui: &mut Ui, rect: Rect, tip_x: f32, tip_y: f32) {
-    // its room claimed, so presses on it stay off the canvas
-    ui.allocate_rect(rect, Sense::click());
-    let shadow = egui::epaint::Shadow { offset: [0, 0], blur: 51, spread: 0, color: Color32::from_black_alpha(0x38) };
-    ui.painter().add(shadow.as_shape(rect, MENU_CORNER));
-    ui.painter().rect_filled(rect, MENU_CORNER, argb(MENU_FILL));
-    let arrow = vec![
-        pos2(tip_x - MENU_ARROW, rect.bottom() - 0.5),
-        pos2(tip_x + MENU_ARROW, rect.bottom() - 0.5),
-        pos2(tip_x, tip_y),
-    ];
-    ui.painter().add(Shape::convex_polygon(arrow, argb(MENU_FILL), Stroke::NONE));
-}
-
-/// A popover's title, 24 bold, at the top of its inside `inner`.
-pub(crate) fn menu_title(ui: &Ui, inner: Rect, words: &str) {
-    text(
-        ui.painter(),
-        pos2(inner.left() + 12.0, inner.top() + 20.0),
-        Align2::LEFT_CENTER,
-        words,
-        24.0,
-        Weight::Bold,
-        argb(MENU_TEXT),
-    );
-}
-
-/// Where button `index` of `count` is centred on the toolbar `bar`.
-fn button_centre(bar: Rect, button: f32, index: usize, count: usize) -> f32 {
-    let gap = (bar.width() - 32.0 - button * count as f32) / (count.max(2) - 1) as f32;
-    bar.left() + 16.0 + (button + gap) * index as f32 + button / 2.0
-}
-
-/// A segment's name, 13 across.
-fn label_width(ui: &Ui, label: &str) -> f32 {
-    ui.painter().layout_no_wrap(label.into(), Weight::Regular.font(13.0), Color32::WHITE).size().x
-}
-
-/// The room round a segment's icon and name, and between segments: as measured, or tightened
-/// where the pill doesn't fit.
-#[derive(Clone, Copy)]
-struct SegmentPad {
-    start: f32,
-    end: f32,
-    gap: f32,
-}
-
-impl SegmentPad {
-    const ROOMY: SegmentPad = SegmentPad { start: 14.0, end: 20.0, gap: SEGMENT_GAP };
-    const TIGHT: SegmentPad = SegmentPad { start: 6.0, end: 8.0, gap: SEGMENT_GAP_TIGHT };
-
-    /// A segment's width with a name `name` across.
-    fn width(self, name: f32) -> f32 {
-        self.start + 30.0 + 2.0 + name + self.end
-    }
-}
-
-/// One of the four ways: its icon (`size` across) and name, filled blue when chosen, `pad` round
-/// them, all `k` times as big. True when tapped.
-fn segment(
-    ui: &Ui,
-    look: &mut Look,
-    rect: Rect,
-    (icon, label, on): (&Icon, &str, bool),
-    size: f32,
-    pad: SegmentPad,
-    k: f32,
-) -> bool {
-    if on {
-        ui.painter().rect_filled(rect, rect.height() / 2.0, argb(pc::ACCENT));
-    }
-    let ink = if on { Color32::WHITE } else { argb(SEGMENT_TEXT) };
-    look.icon(ui, icon, pos2(rect.left() + (pad.start + 15.0) * k, rect.center().y), size * k, ink);
-    text(
-        ui.painter(),
-        pos2(rect.left() + (pad.start + 32.0) * k, rect.center().y),
-        Align2::LEFT_CENTER,
-        label,
-        13.0 * k,
-        Weight::Regular,
-        ink,
-    );
-    ui.interact(rect, ui.scope_id().with(("segment", label)), Sense::click()).clicked()
-}
-
-/// A toolbar button: its icon (`icon_scale` times its size) centred 30 below its top over its
-/// name (`label_size`; none in a narrow window); blue while its popover is open, grey when it
-/// can't be used. True when tapped.
-fn toolbar_button(ui: &Ui, look: &mut Look, rect: Rect, b: &Button, label_size: Option<f32>, icon_scale: f32) -> bool {
-    let tint = if !b.enabled {
-        argb(BUTTON_DIMMED)
-    } else if b.active {
-        argb(pc::ACCENT)
-    } else {
-        argb(BUTTON_TEXT)
+        best.unwrap_or(0.0)
     };
-    let ink = if b.enabled { argb(BUTTON_TEXT) } else { argb(BUTTON_DIMMED) };
-    look.icon(ui, b.icon, pos2(rect.center().x, rect.top() + 30.0), b.size * icon_scale, tint);
-    if let Some(size) = label_size {
-        text(
-            ui.painter(),
-            pos2(rect.center().x, rect.top() + 50.0),
-            Align2::CENTER_CENTER,
-            b.label,
-            size,
-            Weight::Regular,
-            ink,
-        );
+    Vec2::new(axis(frame.map(|p| p.x), canvas.x, &others.0), axis(frame.map(|p| p.y), canvas.y, &others.1))
+}
+
+/// The snapping lines (the canvas's edges and middle, then `others`) a box's edges or centre lie
+/// on, across (x) and down (y).
+fn lines_under(frame: Quad, canvas: Vec2, others: &(Vec<f32>, Vec<f32>)) -> [Option<f32>; 2] {
+    let axis = |values: [f32; 4], size: f32, others: &[f32]| {
+        let (lo, hi) = values.iter().fold((f32::MAX, f32::MIN), |(lo, hi), &v| (lo.min(v), hi.max(v)));
+        let lines = [0.0, size / 2.0, size];
+        lines.iter().chain(others).copied().find(|&l| [lo, (lo + hi) / 2.0, hi].iter().any(|f| (l - f).abs() < 0.01))
+    };
+    [axis(frame.map(|p| p.x), canvas.x, &others.0), axis(frame.map(|p| p.y), canvas.y, &others.1)]
+}
+
+fn at(q: Quad, i: usize) -> Vec2 {
+    q.get(i % 4).copied().unwrap_or_default()
+}
+
+fn set(q: &mut Quad, i: usize, v: Vec2) {
+    if let Some(p) = q.get_mut(i % 4) {
+        *p = v;
     }
-    b.enabled && ui.interact(rect, ui.scope_id().with(("toolbar button", b.label)), Sense::click()).clicked()
 }
 
-/// A node: a coloured dot on a white disc with a faint shadow, `scale` times its size.
-pub(crate) fn node(painter: &egui::Painter, at: Pos2, colour: Color32, scale: f32) {
-    painter.circle_filled(at, 5.5 * scale + 0.5, argb(NODE_SHADOW));
-    painter.circle_filled(at, 5.5 * scale, Color32::WHITE);
-    painter.circle_filled(at, 3.5 * scale, colour);
+fn centre(q: Quad) -> Vec2 {
+    let [a, b, c, d] = q;
+    (a + b + c + d) * 0.25
 }
 
-/// A switch at `at` (63 × 28): blue with its knob right when on, as the Android app's
-/// (ui/ActionsPanel.kt, Switch). Flipped, the knob slides across as the track's colour follows,
-/// swelling into a clear lens that settles white again. `id` tells it from the others shown.
-pub(crate) fn switch(ui: &Ui, at: Pos2, on: bool, id: impl std::hash::Hash + std::fmt::Debug) {
-    let ctx = ui.ctx();
-    let id = ui.scope_id().with(("switch", id));
-    let k = ctx.animate_bool_with_time_and_easing(id, on, KNOB_SLIDE_S, knob_ease);
-    // the lens: since it was last flipped (not as it first shows)
-    let now = ui.input(|i| i.time);
-    let flipped = ctx.data_mut(|d| {
-        let seen = d.get_temp_mut_or_insert_with(id.with("flipped"), || (on, f64::NEG_INFINITY));
-        if seen.0 != on {
-            *seen = (on, now);
+fn angle(v: Vec2) -> f32 {
+    v.y.atan2(v.x)
+}
+
+/// The scale about `anchor` that brings `point` nearest `target` along the line through them.
+fn projected_scale(target: Vec2, point: Vec2, anchor: Vec2) -> f32 {
+    let (t, p) = (target - anchor, point - anchor);
+    let len2 = p.x * p.x + p.y * p.y;
+    if len2 <= 1e-12 {
+        return 1.0;
+    }
+    ((t.x * p.x + t.y * p.y) / len2).max(MIN_SCALE)
+}
+
+fn scale_about(anchor: Vec2, s: f32) -> Affine {
+    Affine::translate(Vec2::ZERO - anchor).then(Affine::scale(s)).then(Affine::translate(anchor))
+}
+
+/// The box's own axes (its top and left edges) as a linear map from unit axes.
+fn basis(f: Quad) -> Option<Affine> {
+    let [a, b, _, d] = f;
+    let (e1, e2) = (b - a, d - a);
+    let m = Affine { a: e1.x, b: e1.y, c: e2.x, d: e2.y, e: 0.0, f: 0.0 };
+    (m.determinant().abs() > 1e-9).then_some(m)
+}
+
+/// Scaling by `sx` along the box's top edge and `sy` along its left edge, about `anchor`.
+fn axes_scale_about(f: Quad, anchor: Vec2, sx: f32, sy: f32) -> Option<Affine> {
+    let b = basis(f)?;
+    let s = Affine { a: sx, d: sy, ..Affine::IDENTITY };
+    Some(Affine::translate(Vec2::ZERO - anchor).then(b.inverse()?).then(s).then(b).then(Affine::translate(anchor)))
+}
+
+fn map_placement(p: &Placement, m: Affine) -> Placement {
+    Placement {
+        content: p.content.map(|v| m.apply(v)),
+        frame: p.frame.map(|v| m.apply(v)),
+        warp: p.warp.map(|w| w.map(|v| m.apply(v))),
+    }
+}
+
+/// Everything carried along as the box goes from where it is to `frame`.
+fn carry_all(p: &Placement, frame: Quad) -> Option<Placement> {
+    let h = Homography::quad_to_quad(p.frame, frame)?;
+    let content = carry(p, frame)?;
+    let warp = match p.warp {
+        Some(m) => {
+            let mut out = m;
+            for v in &mut out {
+                *v = h.apply(*v)?;
+            }
+            Some(out)
         }
-        seen.1
-    });
-    let e = (now - flipped) as f32;
-    let lens = if e < SWELL_S {
-        ease_in_out(e / SWELL_S)
-    } else if e < SWELL_S + SWELL_HOLD_S {
-        1.0
-    } else if e < SWELL_S + SWELL_HOLD_S + SETTLE_S {
-        1.0 - ease_in_out((e - SWELL_S - SWELL_HOLD_S) / SETTLE_S)
-    } else {
-        0.0
+        None => None,
     };
-    if e < SWELL_S + SWELL_HOLD_S + SETTLE_S {
-        ctx.request_repaint();
+    Some(Placement { content, frame, warp })
+}
+
+/// A drag in a warp: a control point (a corner node is its control point), or the surface under the
+/// touch; off the mesh, the whole mesh moves. The box follows the mesh's corners.
+fn warped(mesh: Mesh, handle: Handle, from: Vec2, delta: Vec2) -> Placement {
+    let point = match handle {
+        Handle::Mesh(k) => Some(usize::from(k % 16)),
+        Handle::Corner(i) => [0, 3, 15, 12].get(usize::from(i % 4)).copied(),
+        _ => None,
+    };
+    let next = match point {
+        Some(k) => {
+            let mut m = mesh;
+            if let Some(p) = m.get_mut(k) {
+                *p = *p + delta;
+            }
+            m
+        }
+        None => match warp::locate(&mesh, from) {
+            Some((u, v)) => warp::drag_surface(&mesh, u, v, delta),
+            None => mesh.map(|p| p + delta),
+        },
+    };
+    let corners = [next[0], next[3], next[15], next[12]];
+    Placement { content: corners, frame: corners, warp: Some(next) }
+}
+
+/// How far (canvas pixels) each corner may be from an exact move, quarter turn or mirror and still
+/// count as one: more than the rounding of corners kept as `f32` on the biggest canvas, less than
+/// any change a hand or a typed number makes.
+const WHOLE_PIXEL_REACH: f32 = 0.01;
+
+/// `to` as the upright rectangle `from` moved the nearest whole number of pixels: when `to` is
+/// `from` moved, turned by quarter turns or mirrored, to within [`WHOLE_PIXEL_REACH`] at each
+/// corner; none otherwise.
+fn whole_pixel_move(from: Quad, to: Quad) -> Option<Quad> {
+    let [a, b, _, d] = from;
+    let (width, height) = (b.x - a.x, d.y - a.y);
+    if !(width > 0.0 && height > 0.0 && b.y == a.y && d.x == a.x) {
+        return None;
     }
-    let track = Rect::from_min_size(at, vec2(63.0, 28.0));
-    ui.painter().rect_filled(track, 14, mix(argb(SWITCH_OFF), argb(pc::ACCENT), k));
-    // not clipped to the track: the swollen knob spills over it
-    let centre = at + vec2(2.0 + 22.0 * k + 37.0 / 2.0, 2.0 + 12.0);
-    let knob = Rect::from_center_size(centre, vec2(37.0 * (1.0 + 0.35 * lens), 24.0 * (1.0 + 0.4 * lens)));
-    let round = knob.height() / 2.0;
-    ui.painter().rect_filled(knob, round, Color32::WHITE.gamma_multiply(1.0 - 0.7 * lens));
-    if lens > 0.0 {
-        let rim = Stroke::new(1.0, Color32::WHITE.gamma_multiply(0.55 * lens));
-        ui.painter().rect_stroke(knob, round, rim, egui::StrokeKind::Inside);
+    // where the rectangle's own axes went, each to the nearest of the four ways along the canvas's
+    let [p, q, _, s] = to;
+    let axis = |v: Vec2, length: f32| Vec2::new((v.x / length).round(), (v.y / length).round());
+    let (across, down) = (axis(q - p, width), axis(s - p, height));
+    let unit = |v: Vec2| v.x.abs() + v.y.abs() == 1.0;
+    if !(unit(across) && unit(down) && across.dot(down) == 0.0) {
+        return None;
     }
-}
-
-/// A switch's knob sliding across, and its lens swelling, held and settling (seconds).
-const KNOB_SLIDE_S: f32 = 0.33;
-const SWELL_S: f32 = 0.07;
-const SWELL_HOLD_S: f32 = 0.14;
-const SETTLE_S: f32 = 0.12;
-
-fn knob_ease(t: f32) -> f32 {
-    crate::look::cubic_bezier(0.3, 0.0, 0.2, 1.0, t)
-}
-
-fn ease_in_out(t: f32) -> f32 {
-    crate::look::cubic_bezier(0.42, 0.0, 0.58, 1.0, t)
-}
-
-/// A popover's slider row (59 tall): its name and value, then a thin slider, blue up to a small
-/// white knob. Returns the value set, while held.
-pub(crate) fn menu_slider(ui: &Ui, row: Rect, label: &str, value: f32, shown: &str) -> Option<f32> {
-    menu_slider_let_go(ui, row, label, value, shown).0
-}
-
-/// [`menu_slider`], and whether the pointer let go of it this frame (a drag's or a tap's end).
-pub(crate) fn menu_slider_let_go(ui: &Ui, row: Rect, label: &str, value: f32, shown: &str) -> (Option<f32>, bool) {
-    let ink = argb(MENU_TEXT);
-    text(ui.painter(), pos2(row.left() + 14.0, row.top() + 9.0), Align2::LEFT_TOP, label, 16.0, Weight::Regular, ink);
-    text(ui.painter(), pos2(row.right() - 13.0, row.top() + 9.0), Align2::RIGHT_TOP, shown, 16.0, Weight::Regular, ink);
-    let bar = Rect::from_min_size(pos2(row.left(), row.top() + 38.0), vec2(row.width(), 14.0));
-    let (start, end) = (bar.left() + 21.5, bar.right() - 15.0);
-    let y = bar.center().y;
-    let x = start + (end - start) * value.clamp(0.0, 1.0);
-    ui.painter().line_segment([pos2(x, y), pos2(end, y)], Stroke::new(2.0, argb(SLIDER_REST)));
-    ui.painter().line_segment([pos2(start, y), pos2(x, y)], Stroke::new(2.0, argb(pc::ACCENT)));
-    let knob = Rect::from_center_size(pos2(x, y), vec2(15.0, 11.0));
-    ui.painter().rect_filled(knob.translate(vec2(0.0, 0.5)), 5.5, Color32::from_black_alpha(0x33));
-    ui.painter().rect_filled(knob, 5.5, Color32::WHITE);
-    let response =
-        ui.interact(bar.expand2(vec2(0.0, 6.0)), ui.scope_id().with(("menu slider", label)), Sense::click_and_drag());
-    let let_go = response.drag_stopped() || response.clicked();
-    let value = response.interact_pointer_pos().map(|p| ((p.x - start) / (end - start)).clamp(0.0, 1.0));
-    (value, let_go)
-}
-
-fn interpolation_name(i: Interpolation, short: bool) -> &'static str {
-    match i {
-        Interpolation::Nearest if short => "Nearest",
-        Interpolation::Nearest => "Nearest Neighbor",
-        Interpolation::Bilinear => "Bilinear",
-        Interpolation::Bicubic => "Bicubic",
+    let turned = |v: Vec2| across * v.x + down * v.y;
+    // the move: what the corners say on average, which each must say to within the reach
+    let offset = from.iter().zip(&to).fold(Vec2::ZERO, |sum, (f, t)| sum + (*t - turned(*f))) * 0.25;
+    if !offset.is_finite() || from.iter().zip(&to).any(|(f, t)| t.distance(turned(*f) + offset) > WHOLE_PIXEL_REACH) {
+        return None;
     }
+    let whole = Vec2::new(offset.x.round(), offset.y.round());
+    Some(from.map(|f| turned(f) + whole))
+}
+
+/// The content carried along as the box goes from where it is to `frame`.
+fn carry(p: &Placement, frame: Quad) -> Option<Quad> {
+    let h = Homography::quad_to_quad(p.frame, frame)?;
+    let [a, b, c, d] = p.content;
+    Some([h.apply(a)?, h.apply(b)?, h.apply(c)?, h.apply(d)?])
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// The transform toolbar's and the selection toolbar's layouts in a window `width` wide.
-    fn transform(width: f32) -> ToolbarFit {
-        toolbar_layout(width, 7, BUTTON_ROOMY, 50.0)
+    fn close(a: Vec2, b: Vec2) -> bool {
+        a.distance(b) < 1e-3
     }
 
-    fn selection(width: f32) -> ToolbarFit {
-        toolbar_layout(width, 8, 83.0, 44.0)
+    fn quad_close(a: Quad, b: Quad) -> bool {
+        a.iter().zip(&b).all(|(p, q)| close(*p, *q))
+    }
+
+    fn rect(x: f32, y: f32, w: f32, h: f32) -> Quad {
+        [Vec2::new(x, y), Vec2::new(x + w, y), Vec2::new(x + w, y + h), Vec2::new(x, y + h)]
+    }
+
+    const NONE: Guides = Guides { magnetics: false, lock_after: 0.0, snap: None, canvas: Vec2::ZERO };
+
+    fn box_100x200() -> Transform {
+        Transform::new(100.0, 100.0, 100.0, 200.0, Vec::new())
     }
 
     #[test]
-    fn with_room_the_toolbars_are_as_measured_in_landscape() {
-        for width in [1133.0, 1280.0, 2000.0] {
-            assert_eq!((transform(width).width, transform(width).button), (769.0, 89.0));
-            assert_eq!((selection(width).width, selection(width).button), (829.0, 83.0));
-            assert!(transform(width).names && selection(width).names);
+    fn moving_carries_box_and_content_and_undoes() {
+        let mut t = box_100x200();
+        t.grab(Handle::Move, Vec2::new(150.0, 150.0));
+        assert!(t.drag(TransformMode::Uniform, Vec2::new(160.0, 130.0), &NONE));
+        t.release();
+        assert!(quad_close(t.content(), rect(110.0, 80.0, 100.0, 200.0)));
+        assert!(quad_close(t.frame(), t.content()));
+        assert!(t.can_undo());
+        assert!(t.undo());
+        assert!(quad_close(t.content(), rect(100.0, 100.0, 100.0, 200.0)));
+        assert!(!t.undo());
+    }
+
+    #[test]
+    fn uniform_corners_scale_about_the_opposite_corner() {
+        let mut t = box_100x200();
+        t.grab(Handle::Corner(2), Vec2::new(200.0, 300.0));
+        // along the diagonal: twice the size
+        t.drag(TransformMode::Uniform, Vec2::new(300.0, 500.0), &NONE);
+        assert!(quad_close(t.content(), rect(100.0, 100.0, 200.0, 400.0)));
+        // off the diagonal: the nearest point on it
+        t.drag(TransformMode::Uniform, Vec2::new(300.0, 300.0), &NONE);
+        let s = (200.0 * 100.0 + 200.0 * 200.0) / (100.0 * 100.0 + 200.0 * 200.0);
+        assert!(quad_close(t.content(), rect(100.0, 100.0, 100.0 * s, 200.0 * s)));
+    }
+
+    #[test]
+    fn uniform_edges_scale_about_the_opposite_edge() {
+        let mut t = box_100x200();
+        t.grab(Handle::Edge(1), Vec2::new(200.0, 200.0));
+        t.drag(TransformMode::Uniform, Vec2::new(250.0, 260.0), &NONE);
+        // the left edge's middle (100, 200) stays
+        assert!(quad_close(t.content(), rect(100.0, 50.0, 150.0, 300.0)));
+    }
+
+    #[test]
+    fn freeform_stretches_along_the_box() {
+        let mut t = box_100x200();
+        t.grab(Handle::Corner(2), Vec2::new(200.0, 300.0));
+        t.drag(TransformMode::Freeform, Vec2::new(300.0, 320.0), &NONE);
+        assert!(quad_close(t.content(), rect(100.0, 100.0, 200.0, 220.0)));
+        t.release();
+        t.grab(Handle::Edge(0), Vec2::new(200.0, 100.0));
+        t.drag(TransformMode::Freeform, Vec2::new(500.0, 210.0), &NONE);
+        assert!(quad_close(t.content(), rect(100.0, 210.0, 200.0, 110.0)));
+        // and along a turned box's own axes
+        let mut t = box_100x200();
+        t.rotate(std::f32::consts::FRAC_PI_2);
+        let [_, _, br, _] = t.frame();
+        t.grab(Handle::Corner(2), br);
+        t.drag(TransformMode::Freeform, br + Vec2::new(-50.0, 0.0), &NONE);
+        let [a, b, _, d] = t.frame();
+        assert!((a.distance(b) - 100.0).abs() < 1e-3 && (a.distance(d) - 250.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn distort_moves_corners_and_edges_on_their_own() {
+        let mut t = box_100x200();
+        t.grab(Handle::Corner(1), Vec2::new(200.0, 100.0));
+        t.drag(TransformMode::Distort, Vec2::new(230.0, 80.0), &NONE);
+        let [a, b, c, d] = t.content();
+        assert!(close(a, Vec2::new(100.0, 100.0)) && close(b, Vec2::new(230.0, 80.0)));
+        assert!(close(c, Vec2::new(200.0, 300.0)) && close(d, Vec2::new(100.0, 300.0)));
+        t.release();
+        t.grab(Handle::Edge(3), Vec2::new(100.0, 200.0));
+        t.drag(TransformMode::Distort, Vec2::new(90.0, 200.0), &NONE);
+        let [a, _, _, d] = t.content();
+        assert!(close(a, Vec2::new(90.0, 100.0)) && close(d, Vec2::new(90.0, 300.0)));
+    }
+
+    #[test]
+    fn rotating_turns_about_the_centre_and_a_cancelled_drag_goes_back() {
+        let mut t = box_100x200();
+        t.grab(Handle::Rotate, Vec2::new(150.0, 50.0));
+        // from straight above the centre (150, 200) to straight right of it: a quarter turn
+        t.drag(TransformMode::Uniform, Vec2::new(400.0, 200.0), &NONE);
+        let [a, ..] = t.content();
+        assert!(close(a, Vec2::new(250.0, 150.0)), "{a:?}");
+        t.cancel_drag();
+        assert!(quad_close(t.content(), rect(100.0, 100.0, 100.0, 200.0)));
+        assert!(!t.can_undo());
+    }
+
+    #[test]
+    fn two_fingers_move_turn_and_scale_the_content_about_them_as_one_step() {
+        let mut t = box_100x200();
+        let (a, b) = (Vec2::new(100.0, 100.0), Vec2::new(200.0, 100.0));
+        t.grab(Handle::Move, a);
+        // spread to twice as far apart, a quarter turn clockwise, about the first finger
+        assert!(t.pinch([a, b], [a, Vec2::new(100.0, 300.0)]));
+        // the box's top left corner was under the first finger, and stays there
+        let [tl, tr, ..] = t.frame();
+        assert!(close(tl, a) && close(tr, Vec2::new(100.0, 300.0)), "{tl:?} {tr:?}");
+        assert!(quad_close(t.content(), t.frame()));
+        // measured from where they took it, not step by step
+        assert!(t.pinch([a, b], [a, b]));
+        assert!(quad_close(t.frame(), rect(100.0, 100.0, 100.0, 200.0)));
+        assert!(t.pinch([a, b], [a + Vec2::new(10.0, 0.0), b + Vec2::new(10.0, 0.0)]));
+        t.release();
+        assert!(t.can_undo());
+        t.undo();
+        assert!(!t.can_undo());
+        assert!(quad_close(t.frame(), rect(100.0, 100.0, 100.0, 200.0)));
+    }
+
+    #[test]
+    fn a_pinch_needs_the_content_taken_and_two_fingers_apart() {
+        let mut t = box_100x200();
+        let (a, b) = (Vec2::new(100.0, 100.0), Vec2::new(200.0, 100.0));
+        assert!(!t.pinch([a, b], [a, a + Vec2::new(0.0, 50.0)]));
+        t.grab(Handle::Move, a);
+        assert!(!t.pinch([a, a], [a, b]));
+        assert!(!t.pinch([a, b], [a, a]));
+        assert!(!t.pinch([a, b], [a, Vec2::new(f32::NAN, 0.0)]));
+        // fingers brought together leave the box small, never turned inside out
+        assert!(t.pinch([a, b], [a, a + Vec2::new(0.01, 0.0)]));
+        let [tl, tr, ..] = t.frame();
+        assert!(tr.x > tl.x);
+        t.cancel_drag();
+        assert!(quad_close(t.frame(), rect(100.0, 100.0, 100.0, 200.0)));
+    }
+
+    /// The width of the box, and whether what it holds can be drawn where it is.
+    fn width_drawable(t: &Transform) -> (f32, bool) {
+        let content = t.content();
+        let drawable = content.iter().chain(&t.frame()).all(|p| p.is_finite())
+            && Homography::quad_to_quad(content, t.source()).is_some();
+        (t.size().0, drawable)
+    }
+
+    #[test]
+    fn one_pinch_scales_1024_times_at_most_and_pinches_again_and_again_leave_it_drawable() {
+        let mut t = box_100x200();
+        let (a, b) = (Vec2::new(150.0, 200.0), Vec2::new(250.0, 200.0));
+        // fingers 100 apart brought to a hair: a 1024th of the size, no less
+        t.grab(Handle::Move, a);
+        assert!(t.pinch([a, b], [Vec2::new(199.9994, 200.0), Vec2::new(200.0006, 200.0)]));
+        t.release();
+        assert!((t.size().0 - 100.0 / 1024.0).abs() < 1e-4, "{:?}", t.size());
+        // a hair apart spread wide: 1024 times, no more
+        let mut wide = box_100x200();
+        wide.grab(Handle::Move, a);
+        assert!(wide.pinch([Vec2::new(199.9994, 200.0), Vec2::new(200.0006, 200.0)], [a, b]));
+        assert!((wide.size().0 - 100.0 * 1024.0).abs() < 1.0, "{:?}", wide.size());
+        // pinched in quickly again and again, about wherever the fingers are: it gets as small as
+        // can still be drawn, and stays drawable
+        for k in 0..40 {
+            let (a, b) = (Vec2::new(100.0 + k as f32, 300.0), Vec2::new(300.0 + k as f32, 300.0));
+            t.grab(Handle::Move, a);
+            t.pinch([a, b], [Vec2::new(199.9994, 300.0), Vec2::new(200.0006, 300.0)]);
+            t.release();
+            let (width, drawable) = width_drawable(&t);
+            assert!(drawable && width > 0.0, "pinch {k}: {:?}", t.frame());
         }
-    }
-
-    #[test]
-    fn an_upright_window_has_the_toolbars_measured_upright() {
-        // 728 wide on a 744 window: buttons 83 wide, and the selection's 70 wide
-        let (t, s) = (transform(744.0), selection(744.0));
-        assert_eq!((t.width, s.width), (728.0, 728.0));
-        assert!((t.button - 83.0).abs() < 0.5 && (s.button - 70.0).abs() < 0.5, "{t:?} {s:?}");
-        assert!(t.names && s.names && t.icon_scale == 1.0 && s.icon_scale == 1.0);
-    }
-
-    /// Every window from 300 to 2000 wide: the toolbar fits it, its buttons never overlap (each
-    /// one's pitch at least as wide as it), names go under 716, and icons shrink only where they
-    /// would run into each other.
-    #[test]
-    fn the_toolbars_fit_every_window_and_their_buttons_never_overlap() {
-        for w in 300..=2000 {
-            let width = w as f32;
-            for (fit, count, icon) in [(transform(width), 7.0, 50.0), (selection(width), 8.0, 44.0)] {
-                assert!(fit.width <= width - 16.0 + 0.01, "{w}");
-                let row = fit.button * count + BUTTON_GAP * (count - 1.0) + 32.0;
-                assert!((fit.width - row).abs() < 0.01, "{w}");
-                assert_eq!(fit.names, w >= 716, "{w}");
-                let pitch = fit.button + BUTTON_GAP;
-                assert!(icon * fit.icon_scale <= pitch + 0.01, "{w}");
-                if pitch >= icon {
-                    assert_eq!(fit.icon_scale, 1.0, "{w}");
-                }
-            }
+        // and spread out again and again, it stays a number
+        for k in 0..40 {
+            let (a, b) = (Vec2::new(199.9994, 300.0), Vec2::new(200.0006, 300.0));
+            wide.grab(Handle::Move, a);
+            wide.pinch([a, b], [Vec2::new(100.0 - k as f32, 300.0), Vec2::new(300.0 + k as f32, 300.0)]);
+            wide.release();
+            let (width, drawable) = width_drawable(&wide);
+            assert!(drawable && width.is_finite(), "pinch {k}: {:?}", wide.frame());
         }
-        // a window 320 points across (a narrow one with the interface made larger)
-        let s = selection(320.0);
-        assert!(!s.names && s.button > 0.0 && s.width == 304.0);
+        // every step back undoes, to where it started
+        while t.undo() {}
+        assert!(quad_close(t.frame(), rect(100.0, 100.0, 100.0, 200.0)));
+    }
+
+    #[test]
+    fn turning_the_box_refits_it_and_leaves_the_content() {
+        let hull = vec![Vec2::new(100.0, 100.0), Vec2::new(200.0, 100.0), Vec2::new(100.0, 300.0)];
+        let mut t = Transform::new(100.0, 100.0, 100.0, 200.0, hull);
+        // the node below the box, a quarter turn clockwise about the centre
+        t.grab(Handle::TurnBox, Vec2::new(150.0, 350.0));
+        t.drag(TransformMode::Uniform, Vec2::new(0.0, 200.0), &NONE);
+        assert!(quad_close(t.content(), rect(100.0, 100.0, 100.0, 200.0)));
+        let [a, b, c, d] = t.frame();
+        // a quarter turn: the box's top runs down the screen; it still just holds the triangle
+        assert!(close(a, Vec2::new(200.0, 100.0)) && close(b, Vec2::new(200.0, 300.0)), "{a:?} {b:?}");
+        assert!(close(c, Vec2::new(100.0, 300.0)) && close(d, Vec2::new(100.0, 100.0)), "{c:?} {d:?}");
+    }
+
+    #[test]
+    fn flips_rotation_fit_and_reset() {
+        let mut t = box_100x200();
+        t.flip_horizontal();
+        let [a, b, ..] = t.content();
+        assert!(close(a, Vec2::new(200.0, 100.0)) && close(b, Vec2::new(100.0, 100.0)));
+        assert!(quad_close(t.frame(), rect(100.0, 100.0, 100.0, 200.0)));
+        t.flip_horizontal();
+        t.flip_vertical();
+        let [a, .., d] = t.content();
+        assert!(close(a, Vec2::new(100.0, 300.0)) && close(d, Vec2::new(100.0, 100.0)));
+        t.reset();
+        t.rotate(std::f32::consts::FRAC_PI_4);
+        assert!(close(centre(t.frame()), Vec2::new(150.0, 200.0)));
+        let [a, b, ..] = t.frame();
+        assert!((angle(b - a) - std::f32::consts::FRAC_PI_4).abs() < 1e-4);
+        // fitted turned as it is: the turned box's upright bounds fill the canvas's side
+        t.fit(1000.0, 1000.0);
+        let [a, b, ..] = t.frame();
+        assert!((angle(b - a) - std::f32::consts::FRAC_PI_4).abs() < 1e-4);
+        assert!(close(centre(t.frame()), Vec2::new(500.0, 500.0)));
+        let (w, h) = t.size();
+        let k = 1000.0 / (300.0 / std::f32::consts::SQRT_2);
+        assert!((w - 100.0 * k).abs() < 1e-2 && (h - 200.0 * k).abs() < 1e-2, "{w} {h}");
+        let xs = t.frame().map(|p| p.x);
+        assert!(xs.iter().any(|x| x.abs() < 1e-2) && xs.iter().any(|x| (x - 1000.0).abs() < 1e-2), "{xs:?}");
+        t.reset();
+        assert!(quad_close(t.content(), rect(100.0, 100.0, 100.0, 200.0)));
+        // every action was a step
+        let mut steps = 0;
+        while t.undo() {
+            steps += 1;
+        }
+        assert_eq!(steps, 7);
+        // a reset with nothing changed is not a step
+        t.reset();
+        assert!(!t.can_undo());
+    }
+
+    #[test]
+    fn fit_to_canvas_keeps_flips_and_turns() {
+        // flipped across: fitted, the content's left edge is still on the box's right
+        let mut t = box_100x200();
+        t.flip_horizontal();
+        t.fit(1000.0, 1000.0);
+        assert!(quad_close(t.frame(), rect(250.0, 0.0, 500.0, 1000.0)));
+        let [a, b, c, d] = t.content();
+        assert!(close(a, Vec2::new(750.0, 0.0)) && close(b, Vec2::new(250.0, 0.0)), "{a:?} {b:?}");
+        assert!(close(c, Vec2::new(250.0, 1000.0)) && close(d, Vec2::new(750.0, 1000.0)), "{c:?} {d:?}");
+        // flipped up and down: its top is at the bottom
+        let mut t = box_100x200();
+        t.flip_vertical();
+        t.fit(1000.0, 1000.0);
+        let [a, b, ..] = t.content();
+        assert!(close(a, Vec2::new(250.0, 1000.0)) && close(b, Vec2::new(750.0, 1000.0)), "{a:?} {b:?}");
+        // a quarter turn: the turned box is 200 across and 100 down, so it fits the width
+        let mut t = box_100x200();
+        t.rotate(std::f32::consts::FRAC_PI_2);
+        t.fit(1000.0, 1000.0);
+        let [a, b, c, d] = t.frame();
+        assert!(close(a, Vec2::new(1000.0, 250.0)) && close(b, Vec2::new(1000.0, 750.0)), "{a:?} {b:?}");
+        assert!(close(c, Vec2::new(0.0, 750.0)) && close(d, Vec2::new(0.0, 250.0)), "{c:?} {d:?}");
+        assert!(quad_close(t.content(), t.frame()));
+        // turned and flipped: both kept
+        let mut t = box_100x200();
+        t.flip_horizontal();
+        t.rotate(std::f32::consts::FRAC_PI_2);
+        t.fit(1000.0, 1000.0);
+        let [fa, fb, fc, fd] = t.frame();
+        assert!(quad_close(t.content(), [fb, fa, fd, fc]));
+        assert!(close(fa, Vec2::new(1000.0, 250.0)));
+        // undone in one step, flipped as before
+        let before = t.content();
+        t.fit(500.0, 300.0);
+        assert!(t.undo());
+        assert!(quad_close(t.content(), before));
+    }
+
+    #[test]
+    fn magnetics_keep_moves_and_turns_to_15_degree_steps() {
+        let magnetic = Guides { magnetics: true, lock_after: 4.0, ..NONE };
+        let mut t = box_100x200();
+        t.grab(Handle::Move, Vec2::new(150.0, 200.0));
+        // a short wobble is free
+        t.drag(TransformMode::Uniform, Vec2::new(152.0, 201.0), &magnetic);
+        assert!(close(t.content()[0], Vec2::new(102.0, 101.0)));
+        // 10° below level keeps to level (the step at or below it)
+        let d = Vec2::new(100.0 * 10f32.to_radians().cos(), 100.0 * 10f32.to_radians().sin());
+        t.drag(TransformMode::Uniform, Vec2::new(150.0, 200.0) + d, &magnetic);
+        let [a, ..] = t.content();
+        assert!((a.y - 100.0).abs() < 1e-3 && (a.x - (100.0 + d.x)).abs() < 1e-3, "{a:?}");
+        t.cancel_drag();
+        // a turn of 40° keeps to 45°
+        let c = Vec2::new(150.0, 200.0);
+        t.grab(Handle::Rotate, c + Vec2::new(0.0, -100.0));
+        let turned = (-90f32 + 40.0).to_radians();
+        t.drag(TransformMode::Uniform, c + Vec2::new(turned.cos(), turned.sin()) * 100.0, &magnetic);
+        let [a, b, ..] = t.frame();
+        assert!((angle(b - a).to_degrees() - 45.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn snapping_pulls_a_moved_box_onto_the_canvas_lines() {
+        let snap = Guides { snap: Some(10.0), canvas: Vec2::new(1000.0, 1000.0), ..NONE };
+        let mut t = box_100x200();
+        t.grab(Handle::Move, Vec2::new(150.0, 200.0));
+        // the left edge 6 from the canvas's edge, the middle 4 from the canvas's middle: the nearer wins
+        t.drag(TransformMode::Uniform, Vec2::new(56.0, 504.0), &snap);
+        let [a, ..] = t.content();
+        assert!(close(a, Vec2::new(0.0, 400.0)), "{a:?}");
+        // the lines it snapped onto show while it is held: the canvas's left edge and its middle
+        // (the box's middle, 400 + 100, on it)
+        assert_eq!(t.snapped(), [Some(0.0), Some(500.0)]);
+        // out of reach: free, no lines
+        t.drag(TransformMode::Uniform, Vec2::new(80.0, 470.0), &snap);
+        assert!(close(t.content()[0], Vec2::new(30.0, 370.0)));
+        assert_eq!(t.snapped(), [None, None]);
+        // another layer's right edge at 333 takes the box's left edge, 3 off
+        t.set_snap_targets(&[[233.0, 700.0, 100.0, 100.0]]);
+        t.drag(TransformMode::Uniform, Vec2::new(380.0, 470.0), &snap);
+        assert!(close(t.content()[0], Vec2::new(333.0, 370.0)), "{:?}", t.content()[0]);
+        assert_eq!(t.snapped(), [Some(333.0), None]);
+        // let go, the lines go
+        t.release();
+        assert_eq!(t.snapped(), [None, None]);
+    }
+
+    #[test]
+    fn a_nudge_moves_one_pixel_towards_the_tap() {
+        let mut t = box_100x200();
+        t.nudge(Vec2::new(500.0, 210.0));
+        assert!(close(t.content()[0], Vec2::new(101.0, 100.0)));
+        t.nudge(Vec2::new(151.0, 0.0));
+        assert!(close(t.content()[0], Vec2::new(101.0, 99.0)));
+        t.nudge(centre(t.frame()));
+        assert!(t.undo() && t.undo() && !t.undo());
+    }
+
+    #[test]
+    fn a_warp_bends_through_its_mesh_and_flips_and_resets() {
+        let mut t = box_100x200();
+        t.start_warp();
+        let m = t.warp().unwrap();
+        assert!(close(m[5], Vec2::new(100.0 + 100.0 / 3.0, 100.0 + 200.0 / 3.0)));
+        // a corner node is its control point
+        t.grab(Handle::Corner(2), Vec2::new(200.0, 300.0));
+        t.drag(TransformMode::Warp, Vec2::new(230.0, 310.0), &NONE);
+        t.release();
+        assert!(close(t.warp().unwrap()[15], Vec2::new(230.0, 310.0)));
+        assert!(close(t.frame()[2], Vec2::new(230.0, 310.0)));
+        // the surface under the touch follows it
+        let before = t.warp().unwrap();
+        let at = warp::point(&before, 0.5, 0.5);
+        t.grab(Handle::Move, at);
+        t.drag(TransformMode::Warp, at + Vec2::new(20.0, 0.0), &NONE);
+        assert!(close(warp::point(&t.warp().unwrap(), 0.5, 0.5), at + Vec2::new(20.0, 0.0)));
+        // off the mesh: all of it moves
+        t.grab(Handle::Move, Vec2::new(0.0, 0.0));
+        t.drag(TransformMode::Warp, Vec2::new(5.0, 0.0), &NONE);
+        assert!(close(t.warp().unwrap()[0], before[0] + Vec2::new(5.0, 0.0)));
+        t.release();
+        t.flip_horizontal();
+        let flipped = t.warp().unwrap();
+        assert!(close(flipped[0], before[3] + Vec2::new(5.0, 0.0)));
+        t.rotate(std::f32::consts::FRAC_PI_2);
+        t.reset();
+        assert_eq!(t.warp(), None);
+        assert!(t.undo() && t.warp().is_some());
+    }
+
+    #[test]
+    fn hull_of_a_square_with_inner_points() {
+        let pts = [
+            Vec2::new(0.0, 0.0),
+            Vec2::new(2.0, 0.0),
+            Vec2::new(1.0, 1.0),
+            Vec2::new(2.0, 2.0),
+            Vec2::new(0.0, 2.0),
+            Vec2::new(1.0, 0.0),
+            Vec2::new(0.0, 0.0),
+        ];
+        let hull = convex_hull(&pts);
+        assert_eq!(hull.len(), 4, "{hull:?}");
+        for corner in [Vec2::new(0.0, 0.0), Vec2::new(2.0, 0.0), Vec2::new(2.0, 2.0), Vec2::new(0.0, 2.0)] {
+            assert!(hull.contains(&corner));
+        }
+        assert_eq!(convex_hull(&[Vec2::new(1.0, 1.0)]).len(), 1);
+    }
+
+    #[test]
+    fn a_size_and_an_angle_typed_in() {
+        let mut t = box_100x200();
+        let c = centre(t.frame());
+        t.set_size(50.0, 400.0);
+        let (w, h) = t.size();
+        assert!((w - 50.0).abs() < 1e-3 && (h - 400.0).abs() < 1e-3, "{w} {h}");
+        assert!(close(centre(t.frame()), c));
+        t.set_angle(30f32.to_radians());
+        assert!((t.angle().to_degrees() - 30.0).abs() < 1e-3);
+        // turned, a size keeps the turn
+        t.set_size(100.0, 100.0);
+        assert!((t.angle().to_degrees() - 30.0).abs() < 1e-3);
+        let (w, h) = t.size();
+        assert!((w - 100.0).abs() < 1e-2 && (h - 100.0).abs() < 1e-2);
+        // nothing for sizes under a pixel or not numbers
+        t.set_size(0.5, 10.0);
+        t.set_size(f32::NAN, 10.0);
+        assert!((t.size().0 - 100.0).abs() < 1e-2);
+        assert!(t.undo() && t.undo() && t.undo() && !t.undo());
+    }
+
+    #[test]
+    fn content_moved_lands_on_whole_pixels_halves_away_from_zero() {
+        let mut t = box_100x200();
+        assert_eq!(t.placed(), t.source());
+        t.grab(Handle::Move, Vec2::new(150.0, 150.0));
+        t.drag(TransformMode::Uniform, Vec2::new(150.5, 149.5), &NONE);
+        // the box where it was dragged; the pixels half a pixel on, away from zero
+        assert!(quad_close(t.content(), rect(100.5, 99.5, 100.0, 200.0)));
+        assert_eq!(t.placed(), rect(101.0, 99.0, 100.0, 200.0));
+        t.drag(TransformMode::Uniform, Vec2::new(153.3, 147.8), &NONE);
+        assert_eq!(t.placed(), rect(103.0, 98.0, 100.0, 200.0));
+        t.drag(TransformMode::Uniform, Vec2::new(149.6, 150.4), &NONE);
+        assert_eq!(t.placed(), rect(100.0, 100.0, 100.0, 200.0));
+        // far out on a big canvas, where corners kept as f32 are rounded: still a move
+        let mut far = Transform::new(15000.0, 9000.0, 3.0, 2.0, Vec::new());
+        far.grab(Handle::Move, Vec2::new(15001.0, 9001.0));
+        far.drag(TransformMode::Uniform, Vec2::new(15001.3, 9000.6), &NONE);
+        assert_eq!(far.placed(), rect(15000.0, 9000.0, 3.0, 2.0));
+    }
+
+    #[test]
+    fn content_turned_by_quarters_or_mirrored_lands_on_whole_pixels() {
+        let mut t = box_100x200();
+        t.grab(Handle::Move, Vec2::new(150.0, 150.0));
+        t.drag(TransformMode::Uniform, Vec2::new(150.3, 150.6), &NONE);
+        t.release();
+        let whole = |q: Quad| q.iter().all(|p| p.x.fract() == 0.0 && p.y.fract() == 0.0);
+        // a quarter turn about the box's middle, (150.3, 200.6): the corners come within half a
+        // pixel of where it puts them, each on a whole pixel
+        t.rotate(std::f32::consts::FRAC_PI_2);
+        let (placed, content) = (t.placed(), t.content());
+        assert!(whole(placed), "{placed:?}");
+        assert!(placed.iter().zip(&content).all(|(p, c)| p.distance(*c) <= 0.71), "{placed:?} {content:?}");
+        // the source's top left corner went to the top right, its top edge down the right side
+        assert_eq!(placed[1] - placed[0], Vec2::new(0.0, 100.0));
+        assert_eq!(placed[3] - placed[0], Vec2::new(-200.0, 0.0));
+        // two eighths of a turn make a quarter as well
+        t.undo();
+        t.rotate(std::f32::consts::FRAC_PI_4);
+        t.rotate(std::f32::consts::FRAC_PI_4);
+        assert!(whole(t.placed()), "{:?}", t.placed());
+        t.flip_horizontal();
+        t.flip_vertical();
+        assert!(whole(t.placed()), "{:?}", t.placed());
+    }
+
+    #[test]
+    fn content_scaled_turned_distorted_or_warped_lands_where_it_is() {
+        let mut t = box_100x200();
+        t.rotate(std::f32::consts::FRAC_PI_4);
+        assert_eq!(t.placed(), t.content());
+        t.reset();
+        t.rotate(0.3);
+        assert_eq!(t.placed(), t.content());
+        // a turn too small to see goes on whole pixels
+        t.reset();
+        t.rotate(1e-6);
+        assert_eq!(t.placed(), t.source());
+        t.reset();
+        t.set_size(100.4, 200.0);
+        assert_eq!(t.placed(), t.content());
+        t.reset();
+        t.grab(Handle::Corner(2), Vec2::new(200.0, 300.0));
+        t.drag(TransformMode::Distort, Vec2::new(203.0, 301.0), &NONE);
+        t.release();
+        assert_eq!(t.placed(), t.content());
+        // a warp's mesh, moved as a whole by a fraction, is drawn through the mesh
+        t.reset();
+        t.start_warp();
+        t.grab(Handle::Move, Vec2::new(-50.0, -50.0));
+        t.drag(TransformMode::Warp, Vec2::new(-49.5, -50.0), &NONE);
+        assert!(quad_close(t.content(), rect(100.5, 100.0, 100.0, 200.0)), "{:?}", t.content());
+        assert_eq!(t.placed(), t.content());
     }
 }
