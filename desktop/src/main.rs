@@ -71,6 +71,7 @@ mod timelapse;
 mod tool_header;
 mod touch_keyboard;
 mod transform;
+mod rig;
 mod transform_numeric;
 mod ui;
 mod video;

@@ -181,6 +181,7 @@ pub struct Interface {
     side_bar: SideBar,
     /// Transform: its box over the canvas and its toolbar, while open.
     transform: crate::transform::Transform,
+    rig: crate::rig::Rig,
     /// Selection: its toolbar and what shows while selecting, while open.
     selection: crate::selection::Selection,
     /// The gesture settings (kept between runs), and their page while it is open.
@@ -325,6 +326,7 @@ impl Interface {
             look: Look::default(),
             side_bar: SideBar::default(),
             transform: crate::transform::Transform::default(),
+            rig: crate::rig::Rig::default(),
             selection: crate::selection::Selection::with_color_fill(prefs.selection_color_fill),
             gestures: procraft_core::GestureSettings::new(crate::files::kept_gestures()),
             gesture_controls: crate::gesture_controls::GestureControls::default(),
@@ -447,6 +449,7 @@ impl Interface {
         self.text.forget();
         crate::text::prepare_fonts();
         self.transform.on = false;
+        self.rig = crate::rig::Rig::default();
         self.selection.on = false;
         self.drop.end_filling();
         session.use_colour_history(self.colours.history.clone());
@@ -1096,6 +1099,7 @@ impl Interface {
         );
         self.transform.show(&ctx, &mut self.look, session, &mut backdrops);
         crate::panel::drawing_bottom(&ctx, None);
+        self.rig.show(&ctx, session, self.canvas_rect, !self.transform.on && !self.selection.on && !self.model && adjusting.adjustment.is_none());
         self.plugin_panel(&ctx, session, &mut backdrops);
         // a texture control's sheet, over everything: what it changed kept as the card's would be
         if let Some(key) = self.actions_panel.take_textures_asked() {
