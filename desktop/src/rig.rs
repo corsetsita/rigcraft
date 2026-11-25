@@ -143,7 +143,7 @@ impl Animation {
         }
     }
     fn map(&self, mut p:Pos2, mut i:usize)->Pos2 {
-        loop {let b=&self.bones[i];p=rotated(p,b.joint,self.angles[i].to_radians());match b.parent {Some(parent) if parent<i=>i=parent,_=>break;}}
+        loop {let b=&self.bones[i];p=rotated(p,b.joint,self.angles[i].to_radians());match b.parent {Some(parent) if parent<i=>i=parent,_=>break,}}
         p
     }
     fn show(&mut self,ctx:&egui::Context)->bool {
