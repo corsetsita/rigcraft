@@ -430,6 +430,17 @@ impl State {
 }
 
 impl CanvasSession {
+    /// Desktop rig preview: rotate the active transform about a canvas-space joint.
+    pub fn rig_rotate_about(&self, x: f32, y: f32, radians: f32) -> bool {
+        if !x.is_finite() || !y.is_finite() || !radians.is_finite() { return false; }
+        let mut st = self.shared.lock();
+        let Some(t) = st.transform.as_mut() else { return false; };
+        t.rotate_about(Vec2::new(x, y), radians);
+        st.show_transform();
+        self.shared.frame(&mut st);
+        true
+    }
+
     /// Whether two fingers at these window points take what the box holds: any of them on it,
     /// though never a warp's, whose fingers move the canvas.
     pub(crate) fn fingers_on_box(&self, fingers: impl Iterator<Item = (f32, f32)>) -> bool {
